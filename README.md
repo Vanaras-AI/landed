@@ -2,64 +2,76 @@
 
 **Find code that shipped but never runs.**
 
+```bash
+landed check --graph .
 ```
-landed check .
-```
 
-## The problem
+`landed` reads a Rust crate, builds its call graph, and reports functions that
+the tests can reach but the running program cannot. Not "unused imports" — whole
+features that were written, tested, reviewed, merged, and never connected to
+anything.
 
-An AI agent writes a feature. It writes the tests for that feature. It reports
-success. CI is green, the PR is reviewed, the PR is merged.
+## The failure it looks for
 
-And the feature never runs. Not "has a bug" — it is never reached, by anything,
-ever.
+A feature is built. Tests are written for it. The tests pass. It ships.
 
-This is invisible to every check you already have, because the agent wrote the
-code *and* the tests *and* chose the fixtures. All three came from the same
-process with the same blind spot, so of course they agree with each other.
+And it never runs. Not "has a bug" — nothing ever calls it.
 
-A real example, from the codebase that motivated this tool:
+Here is a real one, from the codebase that prompted this tool:
 
 ```rust
-// The feature: promote a skill when its confidence is high enough.
+// The feature: promote a skill once its confidence is high enough.
 if trace.confidence >= 0.85 { promote(trace); }
 
-// Production, written months earlier, in a different file:
+// Production, in another file, written months earlier:
 SkillTrace { confidence: 0.0, .. }   // every construction site
 ```
 
-The condition can never be true. The feature has never fired.
-
-And the test suite? It contains a helper the agent wrote to manufacture the
-state production cannot produce:
+The condition can never hold. And the test suite contained a helper written to
+manufacture the state production cannot produce:
 
 ```rust
 fn make_promotable_trace(..., confidence: f64, ...) -> SkillTrace
 ```
 
-Every promotion test calls it with `0.9`, `0.95`, `0.88`. All green. For five
-months.
+Every promotion test called it with `0.9`, `0.95`, `0.88`. All green, for five
+months, for a feature that had never once executed.
 
-## What landed does
+Code review does not catch this either: a reviewer sees the change in front of
+them, not the fact that nothing in a 90,000-line system will ever call it.
 
-It reads your crate and reports functions that exist in production code and are
-called **only** by tests.
+## A measurement
 
-```
-NEVER RUN — defined in production, called only by tests
-──────────────────────────────────────────────────────────
+Running `landed --graph` over 26 Rust applications — 9 openly built by AI
+agents, 17 written by humans:
 
-  handle_a2a_request
-    defined  src/a2a.rs:270
-    callers  3 test call(s), 0 production calls
+| | n | Median unreachable | Range |
+|---|---:|---:|---|
+| AI-built applications | 9 | **2.64%** | 1.59 – 20.97% |
+| Human-written applications | 17 | **0.23%** | 0.00 – 2.19% |
 
-  detect_stuck
-    defined  src/stuck_detector.rs:259
-    callers  7 test call(s), 0 production calls
-```
+Mann-Whitney U = 150 of 153, p = 0.00007.
 
-That's it. No LLM, no heuristics, no opinions — a claim you can check by hand in
-thirty seconds, which is exactly what makes it safe to act on.
+Matched by size, since larger codebases accumulate more dead code
+(r = 0.55 among the human projects):
+
+| Functions | AI median | Human median | Ratio |
+|---|---:|---:|---:|
+| 600 – 1,300 | 2.25% | 0.25% | 9× |
+| 1,300 – 2,300 | 12.38% | 0.68% | 18× |
+| 3,000 – 8,000 | 3.25% | 1.35% | 2× |
+
+The shape of the difference matters more than the size of it. Human dead code
+is isolated leftovers — one function here, one there. AI dead code arrives as
+**connected subsystems**: an entry point plus the helpers it calls, an entire
+feature built and never wired in. A per-function check sees only the outermost
+function of such a region and reports 1 where the graph reports 40. That is why
+this needs reachability rather than a linter.
+
+**Caveats, since they matter more than the number.** n = 26 is small. No human
+project in the sample matches the largest AI one (11,530 functions), so the top
+of the AI range is uncontrolled. "AI-built" comes from projects' own README
+claims. Findings were verified by hand in three codebases, not all.
 
 ## Install
 
@@ -67,58 +79,49 @@ thirty seconds, which is exactly what makes it safe to act on.
 cargo install --git https://github.com/Vanaras-AI/landed
 ```
 
-Or build from source:
+## Use
 
 ```bash
-git clone https://github.com/Vanaras-AI/landed && cd landed
-cargo build --release
-./target/release/landed check /path/to/crate
+landed check                     # per-function: does any non-test caller exist?
+landed check --graph             # whole-graph reachability (finds dead subsystems)
+landed check --dot | dot -Tsvg   # call graph, unreachable nodes in red
+landed check --explain my_fn     # every definition and call site for one name
+landed check --json              # machine-readable
+landed check --graph --fail-over 0   # exit 1 on any finding, for CI
 ```
 
-## Usage
+`--graph` is the interesting mode. `check` on its own is the conservative one.
 
-```bash
-landed check                      # scan current directory
-landed check ./src                # scan a path
-landed check --json               # machine-readable output
-landed check --fail-over 10       # exit 1 if more than 10 findings (for CI)
-```
+## What it deliberately stays quiet about
 
-## What it deliberately does not flag
-
-False positives destroy a tool like this, so `landed` stays quiet unless it is
+False positives kill a tool that accuses, so `landed` says nothing unless it is
 confident:
 
-- **Trait impl methods** (`impl Trait for Type`) — reachable by dynamic
-  dispatch, so no direct call site proves nothing.
-- **`#[allow(dead_code)]`** — the author already made this call.
-- **Ambiguous names** — if two production functions share a name, name-based
-  matching can't tell the call sites apart, so it says nothing.
-- **Conventional entry points** — `main`, `new`, `Default::default`, `fmt`,
-  serde hooks, iterator methods.
+- **Trait impl methods** — reachable by dynamic dispatch; no call site proves nothing
+- **`#[no_mangle]` / `extern`** — callable from assembly or another language
+- **A library's public API** — its callers are in other people's crates
+- **`#[allow(dead_code)]`** — the author already decided
+- **Names defined more than once** — edges are matched by name, so a collision means silence
 
-## Known limits
+The design rule throughout: an approximation must be able to **suppress** a
+finding, never to **create** one. Over-count calls and you miss a bug. Over-count
+test-ness and you accuse working code — and after two false accusations nobody
+runs your tool again.
 
-- **Rust only** for now.
-- **Name-based call matching.** A method called only through a generic bound or
-  a function pointer may be reported. Check before acting; every finding names
-  a file and line for exactly that reason.
-- **Public library API.** A `pub fn` intended for downstream consumers has no
-  in-crate caller by design. On a library crate, read findings as "unused
-  *here*", not "unused everywhere".
-- It finds code that is never *called*. It does not yet find code that is
-  called but can never do anything — the `confidence: 0.0` case above needs
-  type-aware dataflow, which is the next check.
+## Limits
 
-## Why this exists
-
-It was written after auditing an 86K-line Rust codebase that an autonomous
-agent had maintained for six months. That codebase had 1,169 passing tests,
-53 merged agent-authored PRs, and 123 functions that had never run — including
-its entire agent-to-agent protocol, its stuck-detector, its privacy budget
-enforcement, and its Telegram output escaping.
-
-Nobody had looked, because nobody had the thing that looks.
+- **Rust only.**
+- **Edges are matched by name**, not resolved by type. A method reached only
+  through a generic bound may be reported. Every finding names a file and line
+  so you can check it, and `--explain` shows the whole picture for one symbol.
+- **Entry points are a model, not a fact.** A workspace containing any binary is
+  treated as an application whose library crates are internal; a workspace with
+  no binary is a library whose entire public API is an entry point. Get this
+  wrong and the tool either accuses everything or nothing — both happened during
+  development.
+- It finds code nothing *calls*. It does not yet find code that is called but
+  can never act — the `confidence: 0.0` case above needs type-aware field
+  analysis, which is the next check.
 
 ## License
 
