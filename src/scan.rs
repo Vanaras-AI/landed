@@ -421,6 +421,23 @@ const ALWAYS_LIVE: &[&str] = &[
     "serialize", "deserialize", "into", "as_ref", "borrow",
 ];
 
+/// How far the analyzer trusts a finding.
+///
+/// The distinction is not cosmetic. A function with no production call site
+/// anywhere is dead by direct evidence — grep confirms it in seconds. A
+/// function that *is* called from production code, whose callers all appear
+/// unreachable, is either a genuine dead subsystem or a chain this analyzer
+/// failed to resolve: async spawns, trait objects and stored closures all
+/// break name-based edges, and everything downstream of the break is then
+/// wrongly condemned.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub enum Confidence {
+    /// No production caller exists anywhere.
+    High,
+    /// Production callers exist, but each of them also looks unreachable.
+    Medium,
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct Finding {
     pub name: String,
@@ -428,6 +445,9 @@ pub struct Finding {
     pub line: usize,
     pub test_calls: usize,
     pub examples: Vec<String>,
+    pub confidence: Confidence,
+    /// Production call sites. Non-zero means Medium confidence.
+    pub prod_calls: usize,
 }
 
 /// A production fn whose only callers are tests: it shipped, but nothing runs it.
@@ -458,6 +478,8 @@ pub fn never_run(scan: &Scan) -> Vec<Finding> {
                     line: d.line,
                     test_calls: c.test,
                     examples: c.examples.clone(),
+                    confidence: Confidence::High,
+                    prod_calls: 0,
                 });
             }
         }
@@ -587,12 +609,15 @@ pub fn never_run_graph(scan: &Scan) -> Vec<Finding> {
         }
         if !prod.contains(&d.name) && test.contains(&d.name) {
             let c = scan.calls.get(&d.name);
+            let prod_calls = c.map(|c| c.prod).unwrap_or(0);
             out.push(Finding {
                 name: d.name.clone(),
                 file: d.file.display().to_string(),
                 line: d.line,
                 test_calls: c.map(|c| c.test).unwrap_or(0),
                 examples: c.map(|c| c.examples.clone()).unwrap_or_default(),
+                confidence: if prod_calls == 0 { Confidence::High } else { Confidence::Medium },
+                prod_calls,
             });
         }
     }
@@ -646,4 +671,208 @@ pub fn ambiguity_report(scan: &Scan) -> (usize, usize) {
     let total = counts.values().sum();
     let ambiguous: usize = counts.values().filter(|&&c| c > 1).sum();
     (ambiguous, total)
+}
+
+// ─── Dead regions ─────────────────────────────────────────────
+
+/// A connected group of unreachable functions.
+///
+/// Reporting forty individual functions is noise; reporting three subsystems
+/// with an entry point each is a work item. A region is a weakly-connected
+/// component of the call graph induced on the unreachable set.
+#[derive(Debug, serde::Serialize)]
+pub struct Region {
+    /// The frontier: where production reachability breaks. This is the
+    /// function to investigate — everything else in the region is downstream
+    /// of it and will become reachable, or disappear, once it is resolved.
+    pub entry: Finding,
+    /// Every other function in the region, nearest-first.
+    pub members: Vec<Finding>,
+    pub size: usize,
+    /// Files the region spans, for a one-line locator.
+    pub files: Vec<String>,
+    /// The weakest confidence among the region's members.
+    pub confidence: Confidence,
+}
+
+/// Group unreachable functions into connected regions and identify each
+/// region's frontier.
+pub fn dead_regions(scan: &Scan) -> Vec<Region> {
+    use std::collections::{HashMap as M, HashSet as S};
+
+    let findings = never_run_graph(scan);
+    if findings.is_empty() {
+        return Vec::new();
+    }
+    let by_name: M<&str, &Finding> = findings.iter().map(|f| (f.name.as_str(), f)).collect();
+    let dead: S<&str> = by_name.keys().copied().collect();
+
+    // Adjacency restricted to the dead set, plus its reverse.
+    let mut fwd: M<&str, Vec<&str>> = M::new();
+    let mut rev: M<&str, Vec<&str>> = M::new();
+    for (from, tos) in &scan.edges {
+        if !dead.contains(from.as_str()) {
+            continue;
+        }
+        for to in tos {
+            if let Some(t) = dead.get(to.as_str()) {
+                if from != to {
+                    fwd.entry(from.as_str()).or_default().push(t);
+                    rev.entry(*t).or_default().push(from.as_str());
+                }
+            }
+        }
+    }
+
+    // Weakly-connected components: walk both directions.
+    let mut seen: S<&str> = S::new();
+    let mut regions = Vec::new();
+    let mut names: Vec<&str> = dead.iter().copied().collect();
+    names.sort_unstable();
+
+    for start in names {
+        if seen.contains(start) {
+            continue;
+        }
+        let mut component: Vec<&str> = Vec::new();
+        let mut queue = vec![start];
+        seen.insert(start);
+        while let Some(n) = queue.pop() {
+            component.push(n);
+            for nb in fwd.get(n).into_iter().flatten().chain(rev.get(n).into_iter().flatten()) {
+                if seen.insert(nb) {
+                    queue.push(nb);
+                }
+            }
+        }
+
+        // The frontier is the member with no caller inside the region. If
+        // several qualify (or none, in a cycle), prefer the one the tests
+        // reach most directly — that is the way in.
+        let entry_name = component
+            .iter()
+            .copied()
+            .filter(|n| rev.get(n).map(|v| v.is_empty()).unwrap_or(true))
+            .max_by_key(|n| by_name[n].test_calls)
+            .or_else(|| component.iter().copied().max_by_key(|n| by_name[n].test_calls))
+            .unwrap_or(start);
+
+        let entry = clone_finding(by_name[entry_name]);
+        let mut members: Vec<Finding> = component
+            .iter()
+            .filter(|n| **n != entry_name)
+            .map(|n| clone_finding(by_name[n]))
+            .collect();
+        members.sort_by(|a, b| b.test_calls.cmp(&a.test_calls).then(a.name.cmp(&b.name)));
+
+        let mut files: Vec<String> = std::iter::once(entry.file.clone())
+            .chain(members.iter().map(|m| m.file.clone()))
+            .collect();
+        files.sort();
+        files.dedup();
+
+        // The frontier decides. A member's production callers are, by
+        // construction, other members of the same region — that is what makes
+        // it a region — so they say nothing about whether the region is
+        // reachable. Only the way *in* matters: if the frontier is entered
+        // solely from tests, everything behind it is unreachable too.
+        let confidence = entry.confidence;
+        regions.push(Region {
+            size: 1 + members.len(),
+            entry,
+            members,
+            files,
+            confidence,
+        });
+    }
+
+    regions.sort_by(|a, b| b.size.cmp(&a.size));
+    regions
+}
+
+fn clone_finding(f: &Finding) -> Finding {
+    Finding {
+        name: f.name.clone(),
+        file: f.file.clone(),
+        line: f.line,
+        test_calls: f.test_calls,
+        examples: f.examples.clone(),
+        confidence: f.confidence,
+        prod_calls: f.prod_calls,
+    }
+}
+
+// ─── Evidence ─────────────────────────────────────────────────
+
+/// Why the analyzer reached its conclusion about one function.
+///
+/// A finding without evidence is an accusation. This is the record a
+/// developer needs to confirm or refute it in under a minute.
+pub struct Evidence {
+    pub name: String,
+    pub defined: Vec<(String, usize)>,
+    pub in_production_set: bool,
+    pub in_test_set: bool,
+    pub is_root: bool,
+    pub root_reason: &'static str,
+    /// Callers, and whether each one is itself reachable from production.
+    pub callers: Vec<(String, bool)>,
+    pub prod_call_sites: usize,
+    pub test_call_sites: usize,
+    pub suppressed: Option<&'static str>,
+}
+
+pub fn evidence(scan: &Scan, name: &str) -> Evidence {
+    let roots = production_roots(scan);
+    let prod = reachable(scan, &roots);
+    let test = reachable(scan, &test_roots(scan));
+
+    let defs: Vec<&FnDef> = scan.defs.iter().filter(|d| d.name == name).collect();
+    let d0 = defs.first();
+
+    // Every function whose edge list contains this name.
+    let mut callers: Vec<(String, bool)> = scan
+        .edges
+        .iter()
+        .filter(|(_, tos)| tos.contains(name))
+        .map(|(from, _)| {
+            let label = if from.is_empty() { "<module level>".to_string() } else { from.clone() };
+            (label, prod.contains(from))
+        })
+        .collect();
+    callers.sort();
+    callers.dedup();
+
+    let root_reason = match d0 {
+        Some(d) if d.is_ffi => "#[no_mangle] / extern",
+        Some(d) if d.trait_impl => "trait impl method (dynamic dispatch)",
+        Some(_) if scan.reexported.contains(name) => "re-exported at crate root",
+        Some(d) if d.is_pub && !is_application(scan) => "public API of a library crate",
+        _ if name == "main" => "program entry point",
+        _ => "not a root",
+    };
+
+    let ambiguous = scan.defs.iter().filter(|o| o.name == name && !o.in_test).count() > 1;
+    let suppressed = match d0 {
+        None => Some("no definition found in the scanned crates"),
+        Some(d) if d.in_test => Some("defined in test code"),
+        Some(d) if d.allowed_dead => Some("#[allow(dead_code)]"),
+        Some(d) if d.trait_impl => Some("trait impl method — dispatch is invisible here"),
+        _ if ambiguous => Some("name is not unique in production; edges cannot be attributed"),
+        _ if ALWAYS_LIVE.contains(&name) => Some("conventional entry point"),
+        _ => None,
+    };
+
+    Evidence {
+        name: name.to_string(),
+        defined: defs.iter().map(|d| (d.file.display().to_string(), d.line)).collect(),
+        in_production_set: prod.contains(name),
+        in_test_set: test.contains(name),
+        is_root: roots.contains(name),
+        root_reason,
+        callers,
+        prod_call_sites: scan.calls.get(name).map(|c| c.prod).unwrap_or(0),
+        test_call_sites: scan.calls.get(name).map(|c| c.test).unwrap_or(0),
+        suppressed,
+    }
 }

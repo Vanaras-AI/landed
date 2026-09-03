@@ -49,6 +49,11 @@ enum Cmd {
         #[arg(long)]
         stats: bool,
 
+        /// List every unreachable function instead of grouping them into
+        /// regions. Regions are the default for --graph.
+        #[arg(long)]
+        flat: bool,
+
         /// Emit the call graph as Graphviz DOT, unreachable nodes in red.
         #[arg(long)]
         dot: bool,
@@ -71,57 +76,79 @@ fn main() -> anyhow::Result<()> {
             graph,
             dot,
             stats,
+            flat,
         } => {
             let scan = scan::scan_crate(&path)?;
 
             if let Some(name) = explain {
-                println!("crates scanned:");
-                for r in scan::resolve_roots(&path) {
-                    println!("  {}", r.display());
-                }
-                println!("\ndefinitions of `{name}`:");
-                for d in scan.defs.iter().filter(|d| d.name == name) {
-                    println!(
-                        "  {}:{}   test={} trait_impl={} allow_dead={}",
-                        d.file.display(),
-                        d.line,
-                        d.in_test,
-                        d.trait_impl,
-                        d.allowed_dead
-                    );
-                }
-                match scan.calls.get(&name) {
-                    Some(c) => {
-                        println!(
-                            "\ncall sites: {} production, {} test",
-                            c.prod, c.test
-                        );
-                        for e in &c.examples {
-                            println!("  test: {e}");
-                        }
+                let e = scan::evidence(&scan, &name);
+                println!("{}\n", e.name);
+                if e.defined.is_empty() {
+                    println!("  not defined in the scanned crates");
+                } else {
+                    for (f, l) in &e.defined {
+                        println!("  defined      {}:{}", rel(f, &path), l);
                     }
-                    None => println!("\ncall sites: none recorded"),
                 }
-                println!(
-                    "\nre-exported at crate root: {}",
-                    scan.reexported.contains(&name)
-                );
-                return Ok(());
-            }
-
-            if stats {
-                let (a, t) = scan::ambiguity_report(&scan);
-                println!("production functions      {t}");
-                println!("non-unique names          {a} ({:.1}%)", a as f64 * 100.0 / t.max(1) as f64);
                 println!();
-                println!("Findings are suppressed for non-unique names, because a");
-                println!("name-keyed graph cannot tell A::process from B::process.");
-                println!("That fraction of the crate is therefore never reported on.");
+                let status = if e.suppressed.is_some() {
+                    "NOT ANALYSED"
+                } else if e.in_production_set {
+                    "reachable from production"
+                } else if e.in_test_set {
+                    "UNREACHABLE — tests reach it, production cannot"
+                } else {
+                    "UNREACHABLE — nothing reaches it at all"
+                };
+                println!("  status       {status}");
+                if let Some(why) = e.suppressed {
+                    println!("  suppressed   {why}");
+                }
+                println!("  entry point  {}", if e.is_root { e.root_reason } else { "no" });
+                println!("  call sites   {} production, {} test", e.prod_call_sites, e.test_call_sites);
+                println!();
+                if e.callers.is_empty() {
+                    println!("  callers      none recorded");
+                } else {
+                    println!("  callers      ({} recorded — 'live' means the caller is itself", e.callers.len());
+                    println!("               reachable from a production entry point)");
+                    for (c, live) in e.callers.iter().take(12) {
+                        println!("                 {:<34} {}", c, if *live { "live" } else { "dead" });
+                    }
+                    if e.callers.len() > 12 {
+                        println!("                 ... and {} more", e.callers.len() - 12);
+                    }
+                    let live = e.callers.iter().filter(|(_, l)| *l).count();
+                    println!();
+                    if live == 0 && !e.callers.is_empty() {
+                        println!("  conclusion   every caller is itself unreachable, so this is");
+                        println!("               downstream of a dead region rather than its cause");
+                    } else if live > 0 && !e.in_production_set {
+                        println!("  conclusion   {live} caller(s) are live but no edge to this function");
+                        println!("               was resolved — likely a limit of name-based matching");
+                    }
+                }
                 return Ok(());
             }
 
             if dot {
                 print!("{}", scan::to_dot(&scan));
+                return Ok(());
+            }
+
+            // Regions are the useful unit for whole-graph analysis: a dead
+            // subsystem is one work item, not forty findings.
+            if graph && !flat {
+                let regions = scan::dead_regions(&scan);
+                let total: usize = regions.iter().map(|r| r.size).sum();
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&regions)?);
+                } else {
+                    report_regions(&scan, &regions, total, &path);
+                }
+                if fail_over > 0 && total > fail_over {
+                    std::process::exit(1);
+                }
                 return Ok(());
             }
 
@@ -174,4 +201,132 @@ fn report(scan: &scan::Scan, findings: &[scan::Finding]) {
 
     println!("\n{}", "─".repeat(78));
     println!("  {} function(s) shipped that nothing runs", findings.len());
+}
+
+/// Header shared by every report: what was scanned, and what could not be.
+fn header(scan: &scan::Scan) {
+    let prod = scan.defs.iter().filter(|d| !d.in_test).count();
+    let (ambiguous, total) = scan::ambiguity_report(scan);
+    println!("landed v{}", env!("CARGO_PKG_VERSION"));
+    println!("  {prod} production functions scanned");
+    if ambiguous > 0 {
+        println!(
+            "  {ambiguous} ({:.1}%) share a name with another function and are not analysed",
+            ambiguous as f64 * 100.0 / total.max(1) as f64
+        );
+    }
+    println!();
+}
+
+/// Print a location relative to the crate that was scanned. Absolute paths
+/// are unreadable in a terminal and unusable in CI annotations.
+fn rel(file: &str, root: &std::path::Path) -> String {
+    let r = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let rs = r.to_string_lossy().to_string();
+    file.strip_prefix(&rs)
+        .map(|s| s.trim_start_matches('/').to_string())
+        .unwrap_or_else(|| {
+            // fall back to the path from the crate's src/ directory
+            file.rsplit_once("/src/")
+                .map(|(_, tail)| format!("src/{tail}"))
+                .unwrap_or_else(|| file.to_string())
+        })
+}
+
+fn report_regions(
+    scan: &scan::Scan,
+    regions: &[scan::Region],
+    total: usize,
+    root: &std::path::Path,
+) {
+    header(scan);
+
+    if regions.is_empty() {
+        println!("  Everything is reachable from production entry points.");
+        return;
+    }
+
+    let (multi, single): (Vec<_>, Vec<_>) = regions.iter().partition(|r| r.size > 1);
+
+    println!(
+        "{total} unreachable function{} in {} region{}",
+        if total == 1 { "" } else { "s" },
+        regions.len(),
+        if regions.len() == 1 { "" } else { "s" }
+    );
+    let hi = regions.iter().filter(|r| r.confidence == scan::Confidence::High).count();
+    println!(
+        "  {hi} confident, {} uncertain (production callers exist but look unreachable)",
+        regions.len() - hi
+    );
+    if !single.is_empty() {
+        println!(
+            "  {} subsystem{} of 2+ functions, and {} lone function{}",
+            multi.len(),
+            if multi.len() == 1 { "" } else { "s" },
+            single.len(),
+            if single.len() == 1 { "" } else { "s" }
+        );
+    }
+
+    for (i, r) in multi.iter().enumerate() {
+        println!("\n{}", "─".repeat(74));
+        let conf = match r.confidence {
+            scan::Confidence::High => "confident",
+            scan::Confidence::Medium => "UNCERTAIN — may be an entry point this analyzer cannot see",
+        };
+        println!("Region {} — {} function{}  [{}]", i + 1, r.size, if r.size == 1 { "" } else { "s" }, conf);
+        println!("{}", "─".repeat(74));
+        println!("  frontier   {}", r.entry.name);
+        println!("             {}:{}", rel(&r.entry.file, root), r.entry.line);
+        println!();
+        if r.entry.prod_calls > 0 {
+            println!(
+                "  entered    {} production call(s) and {} test call(s) — but every",
+                r.entry.prod_calls, r.entry.test_calls
+            );
+            println!("             caller is itself unreachable, so this is either a dead");
+            println!("             subsystem or a root the analyzer failed to resolve");
+        } else if r.entry.test_calls > 0 {
+            println!("  entered    {} test call(s), 0 from production", r.entry.test_calls);
+            for e in r.entry.examples.iter().take(2) {
+                println!("             {}", rel(e, root));
+            }
+        } else {
+            println!("  entered    nothing calls it, in tests or production");
+        }
+        if r.files.len() > 1 {
+            println!("\n  spans      {} files", r.files.len());
+        }
+        if !r.members.is_empty() {
+            println!("\n  downstream {} function(s) reachable only through the frontier:", r.members.len());
+            let show: Vec<&str> = r.members.iter().take(6).map(|m| m.name.as_str()).collect();
+            println!("             {}", show.join(", "));
+            if r.members.len() > show.len() {
+                println!("             ... and {} more", r.members.len() - show.len());
+            }
+        }
+        println!("\n  fix        make {} reachable, or delete the region", r.entry.name);
+    }
+
+    if !single.is_empty() {
+        println!("\n{}", "─".repeat(74));
+        println!("Lone functions — {} with no unreachable callees", single.len());
+        println!("{}", "─".repeat(74));
+        for r in single.iter().take(20) {
+            println!(
+                "  {:32} {}:{}",
+                r.entry.name,
+                rel(&r.entry.file, root),
+                r.entry.line
+            );
+        }
+        if single.len() > 20 {
+            println!("  ... and {} more (--json for the full list)", single.len() - 20);
+        }
+    }
+
+    println!("\n{}", "─".repeat(74));
+    println!("  Start at each subsystem's frontier. Everything downstream of it");
+    println!("  resolves when the frontier does.");
 }
