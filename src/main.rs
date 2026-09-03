@@ -37,6 +37,11 @@ enum Cmd {
         /// Exit with status 1 if any finding exceeds this count (0 = never fail).
         #[arg(long, default_value_t = 0)]
         fail_over: usize,
+
+        /// Show every definition and call site recorded for one function name.
+        /// Use this to check a finding, or to see why one was not reported.
+        #[arg(long, value_name = "FN")]
+        explain: Option<String>,
     },
 }
 
@@ -47,8 +52,45 @@ fn main() -> anyhow::Result<()> {
             path,
             json,
             fail_over,
+            explain,
         } => {
             let scan = scan::scan_crate(&path)?;
+
+            if let Some(name) = explain {
+                println!("crates scanned:");
+                for r in scan::resolve_roots(&path) {
+                    println!("  {}", r.display());
+                }
+                println!("\ndefinitions of `{name}`:");
+                for d in scan.defs.iter().filter(|d| d.name == name) {
+                    println!(
+                        "  {}:{}   test={} trait_impl={} allow_dead={}",
+                        d.file.display(),
+                        d.line,
+                        d.in_test,
+                        d.trait_impl,
+                        d.allowed_dead
+                    );
+                }
+                match scan.calls.get(&name) {
+                    Some(c) => {
+                        println!(
+                            "\ncall sites: {} production, {} test",
+                            c.prod, c.test
+                        );
+                        for e in &c.examples {
+                            println!("  test: {e}");
+                        }
+                    }
+                    None => println!("\ncall sites: none recorded"),
+                }
+                println!(
+                    "\nre-exported at crate root: {}",
+                    scan.reexported.contains(&name)
+                );
+                return Ok(());
+            }
+
             let findings = scan::never_run(&scan);
 
             if json {

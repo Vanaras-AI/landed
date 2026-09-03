@@ -125,6 +125,38 @@ impl<'a> FileVisitor<'a> {
         });
     }
 
+    /// Walk a macro's token stream, recording `ident (` as a call.
+    fn record_tokens(&mut self, ts: proc_macro2::TokenStream) {
+        use proc_macro2::TokenTree;
+        let mut prev: Option<proc_macro2::Ident> = None;
+        for tt in ts {
+            match tt {
+                TokenTree::Ident(id) => {
+                    prev = Some(id);
+                }
+                TokenTree::Group(g) => {
+                    if g.delimiter() == proc_macro2::Delimiter::Parenthesis {
+                        if let Some(id) = prev.take() {
+                            // Only ever record these as PRODUCTION calls, and
+                            // only from production context. Token matching is
+                            // an over-approximation, so it must be able to
+                            // suppress a finding but never to create one:
+                            // crediting a spurious *test* call would push a
+                            // function with no real callers into the report.
+                            if !self.in_test() {
+                                self.scan.calls.entry(id.to_string()).or_default().prod += 1;
+                            }
+                        }
+                    }
+                    // Nested groups hold the macro's real body.
+                    self.record_tokens(g.stream());
+                    prev = None;
+                }
+                _ => prev = None,
+            }
+        }
+    }
+
     fn record_call(&mut self, name: String, span: Span) {
         let in_test = self.in_test();
         let file = self.file.to_path_buf();
@@ -203,6 +235,20 @@ impl<'ast, 'a> Visit<'ast> for FileVisitor<'a> {
             collect(&node.tree, &mut self.scan.reexported);
         }
         syn::visit::visit_item_use(self, node);
+    }
+
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        // A macro body is an opaque token stream to syn, so calls written
+        // inside one are invisible to the expression visitors. Codebases that
+        // generate whole subsystems through macros (syscall tables, handler
+        // registries) would otherwise look as though nothing calls them.
+        //
+        // Scan the tokens for `ident (` and count it as a call. This
+        // over-approximates — a tuple-struct literal or a macro parameter can
+        // match — but over-counting *calls* only ever suppresses a finding,
+        // and a missed finding is far cheaper than a false accusation.
+        self.record_tokens(node.tokens.clone());
+        syn::visit::visit_macro(self, node);
     }
 
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
