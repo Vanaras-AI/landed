@@ -154,10 +154,24 @@ impl<'ast, 'a> Visit<'ast> for FileVisitor<'a> {
     }
 }
 
+/// Resolve what to actually scan.
+///
+/// A Rust crate is a directory with a `Cargo.toml`; its code lives in `src/`.
+/// Scanning everything under a repo root sweeps in vendored copies, examples,
+/// and unrelated nested projects, which inflates counts and produces findings
+/// for code the crate does not own. If `path` is a crate root, scan its `src/`.
+pub fn resolve_root(path: &Path) -> PathBuf {
+    if path.join("Cargo.toml").is_file() && path.join("src").is_dir() {
+        return path.join("src");
+    }
+    path.to_path_buf()
+}
+
 /// Walk a crate root, parse every `.rs` file, and collect defs + calls.
 pub fn scan_crate(root: &Path) -> anyhow::Result<Scan> {
+    let root = resolve_root(root);
     let mut scan = Scan::default();
-    for entry in walkdir::WalkDir::new(root)
+    for entry in walkdir::WalkDir::new(&root)
         .into_iter()
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_file())
@@ -166,9 +180,23 @@ pub fn scan_crate(root: &Path) -> anyhow::Result<Scan> {
         if path.extension().and_then(|s| s.to_str()) != Some("rs") {
             continue;
         }
-        // Skip vendored / generated trees.
+        // Skip vendored, generated, and duplicated trees. Worktrees and vendor
+        // dirs contain whole copies of the crate; counting them inflates every
+        // number and double-counts every finding.
         let s = path.to_string_lossy();
-        if s.contains("/target/") || s.contains("/node_modules/") {
+        const SKIP: &[&str] = &[
+            "/target/",
+            "/node_modules/",
+            "/.git/",
+            "/worktrees/",
+            "/vendor/",
+            "/.cargo/",
+            "/build/",
+            "/dist/",
+            "/temp/",
+            "/examples/",
+        ];
+        if SKIP.iter().any(|d| s.contains(d)) {
             continue;
         }
         let src = match std::fs::read_to_string(path) {
