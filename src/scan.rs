@@ -54,6 +54,8 @@ pub struct Scan {
     pub edges: HashMap<String, std::collections::HashSet<String>>,
     /// Every crate `src/` dir that was scanned.
     pub crate_roots: Vec<PathBuf>,
+    /// Project configuration: developer-declared roots and ignores.
+    pub config: crate::config::Config,
     /// Names re-exported from the crate root (`pub use ...`). These are the
     /// crate's public API: consumers, benches and fuzz targets live outside
     /// the tree we scan, so "no in-crate caller" proves nothing about them.
@@ -411,6 +413,7 @@ pub fn scan_crate(root: &Path) -> anyhow::Result<Scan> {
     }
     }
     scan.crate_roots = roots;
+    scan.config = crate::config::Config::load(root).unwrap_or_default();
     Ok(scan)
 }
 
@@ -457,7 +460,7 @@ pub fn never_run(scan: &Scan) -> Vec<Finding> {
         if d.in_test || d.trait_impl || d.allowed_dead {
             continue;
         }
-        if ALWAYS_LIVE.contains(&d.name.as_str()) {
+        if ALWAYS_LIVE.contains(&d.name.as_str()) || scan.config.is_ignored(&d.name) {
             continue;
         }
         // Re-exported from the crate root: it is public API, and its consumers
@@ -528,6 +531,10 @@ pub fn production_roots(scan: &Scan) -> std::collections::HashSet<String> {
         if d.in_test || d.is_test_fn {
             continue;
         }
+        // A root the developer declared in landed.toml outranks every
+        // heuristic: they know how their program is entered, and the analyzer
+        // cannot see through a task spawn or a handler registry.
+        let declared = scan.config.is_root(&d.name);
         let externally_reachable = if is_application {
             // Only a genuinely external surface counts: FFI symbols and
             // trait methods reached by dynamic dispatch.
@@ -535,7 +542,7 @@ pub fn production_roots(scan: &Scan) -> std::collections::HashSet<String> {
         } else {
             d.is_ffi || d.trait_impl || d.is_pub || scan.reexported.contains(&d.name)
         };
-        if externally_reachable {
+        if declared || externally_reachable {
             roots.insert(d.name.clone());
         }
     }
@@ -593,7 +600,10 @@ pub fn never_run_graph(scan: &Scan) -> Vec<Finding> {
         if d.in_test || d.is_test_fn || d.trait_impl || d.allowed_dead || d.is_ffi {
             continue;
         }
-        if ALWAYS_LIVE.contains(&d.name.as_str()) || scan.reexported.contains(&d.name) {
+        if ALWAYS_LIVE.contains(&d.name.as_str())
+            || scan.reexported.contains(&d.name)
+            || scan.config.is_ignored(&d.name)
+        {
             continue;
         }
         // Name-based edges cannot distinguish two functions sharing a name,

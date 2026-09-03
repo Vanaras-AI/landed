@@ -7,7 +7,7 @@
 //! `landed` builds the crate's call graph and reports functions the tests can
 //! reach but the running program cannot.
 
-use landed::{baseline, scan};
+use landed::{baseline, report, scan};
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -74,6 +74,11 @@ enum Cmd {
         #[arg(long)]
         dot: bool,
 
+        /// Output format: text (default), json, or github (workflow commands
+        /// that annotate the source line in a pull request).
+        #[arg(long, value_name = "FMT", default_value = "text")]
+        format: String,
+
         /// Compare against a baseline and report only findings that are not
         /// in it. Defaults to .landed-baseline.json beside Cargo.toml.
         #[arg(long, value_name = "FILE", num_args = 0..=1, default_missing_value = "")]
@@ -132,8 +137,10 @@ fn main() -> anyhow::Result<()> {
             stats,
             flat,
             baseline: baseline_arg,
+            format,
         } => {
             let scan = scan::scan_crate(&path)?;
+            let format = if json { "json".to_string() } else { format };
 
             if let Some(name) = explain {
                 let e = scan::evidence(&scan, &name);
@@ -261,10 +268,13 @@ fn main() -> anyhow::Result<()> {
             if graph && !flat {
                 let regions = scan::dead_regions(&scan);
                 let total: usize = regions.iter().map(|r| r.size).sum();
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&regions)?);
-                } else {
-                    report_regions(&scan, &regions, total, &path);
+                match format.as_str() {
+                    "json" => println!(
+                        "{}",
+                        serde_json::to_string_pretty(&report::grouped(&scan, &regions))?
+                    ),
+                    "github" => print!("{}", report::github_regions(&regions, &path)),
+                    _ => report_regions(&scan, &regions, total, &path),
                 }
                 if fail_over > 0 && total > fail_over {
                     std::process::exit(1);
@@ -278,10 +288,13 @@ fn main() -> anyhow::Result<()> {
                 scan::never_run(&scan)
             };
 
-            if json {
-                println!("{}", serde_json::to_string_pretty(&findings)?);
-            } else {
-                report(&scan, &findings);
+            match format.as_str() {
+                "json" => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report::flat(&scan, &findings, graph))?
+                ),
+                "github" => print!("{}", report::github(&findings, &path)),
+                _ => report(&scan, &findings),
             }
 
             if fail_over > 0 && findings.len() > fail_over {

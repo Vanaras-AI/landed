@@ -72,7 +72,8 @@ landed check                     # per-function: does any non-test caller exist?
 landed check --graph             # whole-graph reachability (finds dead subsystems)
 landed check --dot | dot -Tsvg   # call graph, unreachable nodes in red
 landed check --explain my_fn     # every definition and call site for one name
-landed check --json              # machine-readable
+landed check --json              # versioned JSON envelope
+landed check --format github     # annotations that land on the PR diff
 landed check --graph --fail-over 0   # exit 1 on any finding, for CI
 ```
 
@@ -98,12 +99,60 @@ visibly. A baseline taken with `--graph` is refused against a per-function run
 and vice versa — otherwise the difference between two analyses would be
 reported as a change in the code.
 
-In CI:
+In CI, with annotations on the diff rather than in log output nobody opens:
 
 ```yaml
 - run: cargo install --git https://github.com/Vanaras-AI/landed
 - run: landed check --graph --baseline
+- run: landed check --graph --format github    # annotate the source lines
 ```
+
+Confident findings annotate as `warning`; uncertain ones as `notice`, because
+a finding the analyzer is unsure about should not decorate a diff with the
+same weight as one it can prove. Regions annotate once, at the frontier —
+forty annotations for one dead subsystem buries the review.
+
+## Telling it what production means
+
+No heuristic finds every entry point. A handler spawned as a task or held in a
+registry breaks the chain from `main`, and everything downstream is then
+reported dead — on one codebase that wrongly included a live PII-redaction
+subsystem. Say what the analyzer cannot infer:
+
+```toml
+# landed.toml, beside Cargo.toml
+roots  = ["handle_webhook", "daemon_process_*"]   # entry points it cannot see
+ignore = ["generated_*", "legacy_shim"]           # never report these
+```
+
+A declared root outranks every heuristic, and everything reachable from it
+becomes live. Patterns take `*`. A malformed or misspelled key is an error
+rather than a silent fallback to no config — otherwise the declarations
+vanish and the tool starts condemning live code again with no indication why.
+
+## JSON is an API
+
+`--json` emits a versioned envelope, not a dump of the text output:
+
+```json
+{
+  "schema": 1,
+  "tool": "landed",
+  "mode": "graph",
+  "summary": {
+    "production_functions": 1997,
+    "unanalysable_names": 777,
+    "unreachable": 216,
+    "confident": 112,
+    "uncertain": 49,
+    "regions": 161
+  },
+  "regions": [ ... ]
+}
+```
+
+`unanalysable_names` is in the summary deliberately: a total reported without
+a coverage figure overstates itself.
 
 ## What it deliberately stays quiet about
 

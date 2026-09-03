@@ -78,18 +78,51 @@ fn explain_shows_evidence_for_one_symbol() {
 }
 
 #[test]
-fn json_is_parseable_json() {
+fn json_carries_a_versioned_envelope() {
+    // JSON is an API, not a dump of the CLI output: a consumer must be able
+    // to refuse a format it does not understand rather than misread it.
     let o = run(&["check", &fixture("test_only"), "--json"]);
     let v: serde_json::Value = serde_json::from_str(&o).expect("must be valid JSON");
-    assert!(v.is_array(), "findings should be an array; got: {o}");
+    assert_eq!(v["schema"], 1, "got: {o}");
+    assert_eq!(v["tool"], "landed", "got: {o}");
+    assert_eq!(v["mode"], "direct", "got: {o}");
+    assert!(v["findings"].is_array(), "got: {o}");
 }
 
 #[test]
-fn graph_json_is_parseable_json() {
+fn json_summary_states_what_could_not_be_analysed() {
+    // A total without a coverage figure overstates itself.
+    let o = run(&["check", &fixture("ambiguous"), "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&o).unwrap();
+    assert!(v["summary"]["production_functions"].is_number(), "got: {o}");
+    assert!(v["summary"]["unanalysable_names"].as_u64().unwrap() > 0, "got: {o}");
+}
+
+#[test]
+fn graph_json_reports_regions_with_confidence() {
     let o = run(&["check", &fixture("dead_region"), "--graph", "--json"]);
     let v: serde_json::Value = serde_json::from_str(&o).expect("must be valid JSON");
-    assert!(v[0]["entry"]["name"].is_string(), "regions need a frontier; got: {o}");
-    assert!(v[0]["confidence"].is_string(), "regions need a confidence; got: {o}");
+    assert_eq!(v["mode"], "graph", "got: {o}");
+    assert_eq!(v["summary"]["regions"], 1, "got: {o}");
+    assert_eq!(v["summary"]["unreachable"], 3, "got: {o}");
+    assert!(v["regions"][0]["entry"]["name"].is_string(), "got: {o}");
+    assert!(v["regions"][0]["confidence"].is_string(), "got: {o}");
+}
+
+#[test]
+fn github_format_annotates_the_source_line() {
+    let o = run(&["check", &fixture("dead_region"), "--graph", "--format", "github"]);
+    assert!(o.starts_with("::warning file="), "got: {o}");
+    assert!(o.contains("line="), "an annotation without a line cannot be placed; got: {o}");
+    assert!(o.contains("dead_entry"), "got: {o}");
+    assert!(!o.contains("landed v"), "annotations only; got: {o}");
+}
+
+#[test]
+fn github_format_annotates_one_line_per_region_not_per_function() {
+    // Forty annotations for one dead subsystem buries the diff.
+    let o = run(&["check", &fixture("dead_region"), "--graph", "--format", "github"]);
+    assert_eq!(o.lines().count(), 1, "three dead functions, one region; got: {o}");
 }
 
 #[test]
