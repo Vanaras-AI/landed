@@ -39,11 +39,54 @@ pub struct Scan {
     pub reexported: std::collections::HashSet<String>,
 }
 
+/// Strip string literals from a token dump, so words inside doc comments and
+/// string arguments cannot be mistaken for identifiers.
+fn tokens_without_strings(a: &syn::Attribute) -> String {
+    let s = a.to_token_stream().to_string();
+    let mut out = String::with_capacity(s.len());
+    let mut in_str = false;
+    let mut prev_escape = false;
+    for c in s.chars() {
+        match c {
+            '"' if !prev_escape => in_str = !in_str,
+            _ if !in_str => out.push(c),
+            _ => {}
+        }
+        prev_escape = c == '\\' && !prev_escape;
+    }
+    out
+}
+
+/// Is `test` present as a bare identifier (not inside a string)?
+fn mentions_test_ident(s: &str) -> bool {
+    s.split(|c: char| !c.is_alphanumeric() && c != '_')
+        .any(|w| w == "test")
+}
+
 /// Does this attribute list contain `#[cfg(test)]`?
+///
+/// Must not match `#[cfg(feature = "fastest")]`, so string literals are
+/// stripped and `test` is matched as a whole identifier.
 fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
-    attrs.iter().any(|a| {
-        a.path().is_ident("cfg") && a.to_token_stream().to_string().contains("test")
-    })
+    attrs
+        .iter()
+        .any(|a| a.path().is_ident("cfg") && mentions_test_ident(&tokens_without_strings(a)))
+}
+
+/// Is this a test harness attribute — `#[test]`, `#[tokio::test]`, `#[bench]`,
+/// `#[rstest]`, `#[proptest]`?
+///
+/// Checked by attribute *path*, never by substring: doc comments are
+/// attributes too, so a function documented as "a test hook" is not a test.
+fn is_test_attr(a: &syn::Attribute) -> bool {
+    let last = match a.path().segments.last() {
+        Some(s) => s.ident.to_string(),
+        None => return false,
+    };
+    matches!(
+        last.as_str(),
+        "test" | "bench" | "rstest" | "proptest" | "quickcheck" | "test_case"
+    )
 }
 
 fn has_allow_dead(attrs: &[syn::Attribute]) -> bool {
@@ -124,10 +167,7 @@ impl<'ast, 'a> Visit<'ast> for FileVisitor<'a> {
 
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
         // A #[test] fn is test code even outside a cfg(test) module.
-        let is_test_fn = node
-            .attrs
-            .iter()
-            .any(|a| a.path().is_ident("test") || a.to_token_stream().to_string().contains("test"));
+        let is_test_fn = node.attrs.iter().any(is_test_attr) || has_cfg_test(&node.attrs);
         self.record_def(node.sig.ident.to_string(), node.sig.ident.span(), &node.attrs);
         if is_test_fn {
             self.test_depth += 1;
