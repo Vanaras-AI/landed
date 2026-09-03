@@ -33,6 +33,10 @@ pub struct CallSites {
 pub struct Scan {
     pub defs: Vec<FnDef>,
     pub calls: HashMap<String, CallSites>,
+    /// Names re-exported from the crate root (`pub use ...`). These are the
+    /// crate's public API: consumers, benches and fuzz targets live outside
+    /// the tree we scan, so "no in-crate caller" proves nothing about them.
+    pub reexported: std::collections::HashSet<String>,
 }
 
 /// Does this attribute list contain `#[cfg(test)]`?
@@ -139,6 +143,28 @@ impl<'ast, 'a> Visit<'ast> for FileVisitor<'a> {
         syn::visit::visit_impl_item_fn(self, node);
     }
 
+    fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
+        // Record every name in a `pub use ...` as crate public API.
+        if matches!(node.vis, syn::Visibility::Public(_)) {
+            fn collect(tree: &syn::UseTree, out: &mut std::collections::HashSet<String>) {
+                match tree {
+                    syn::UseTree::Name(n) => {
+                        out.insert(n.ident.to_string());
+                    }
+                    syn::UseTree::Rename(r) => {
+                        out.insert(r.rename.to_string());
+                        out.insert(r.ident.to_string());
+                    }
+                    syn::UseTree::Path(p) => collect(&p.tree, out),
+                    syn::UseTree::Group(g) => g.items.iter().for_each(|t| collect(t, out)),
+                    syn::UseTree::Glob(_) => {}
+                }
+            }
+            collect(&node.tree, &mut self.scan.reexported);
+        }
+        syn::visit::visit_item_use(self, node);
+    }
+
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
         if let syn::Expr::Path(p) = &*node.func {
             if let Some(seg) = p.path.segments.last() {
@@ -154,25 +180,59 @@ impl<'ast, 'a> Visit<'ast> for FileVisitor<'a> {
     }
 }
 
+/// Directory segments that hold copies of code the crate does not own.
+const SKIP_DIRS: &[&str] = &[
+    "/target/",
+    "/node_modules/",
+    "/.git/",
+    "/worktrees/",
+    "/vendor/",
+    "/.cargo/",
+    "/build/",
+    "/dist/",
+    "/temp/",
+    "/examples/",
+];
+
+fn skipped(p: &Path) -> bool {
+    let s = format!("{}/", p.to_string_lossy());
+    SKIP_DIRS.iter().any(|d| s.contains(d))
+}
+
 /// Resolve what to actually scan.
 ///
 /// A Rust crate is a directory with a `Cargo.toml`; its code lives in `src/`.
-/// Scanning everything under a repo root sweeps in vendored copies, examples,
-/// and unrelated nested projects, which inflates counts and produces findings
-/// for code the crate does not own. If `path` is a crate root, scan its `src/`.
-pub fn resolve_root(path: &Path) -> PathBuf {
-    if path.join("Cargo.toml").is_file() && path.join("src").is_dir() {
-        return path.join("src");
+/// A workspace holds several such crates. Scanning a whole repo tree sweeps in
+/// vendored copies and unrelated nested projects, so instead we locate every
+/// crate the repo owns and scan each one's `src/`.
+pub fn resolve_roots(path: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for entry in walkdir::WalkDir::new(path)
+        .max_depth(4)
+        .into_iter()
+        .filter_entry(|e| !skipped(e.path()))
+        .filter_map(Result::ok)
+    {
+        if entry.file_name() == "Cargo.toml" {
+            let src = entry.path().with_file_name("src");
+            if src.is_dir() {
+                roots.push(src);
+            }
+        }
     }
-    path.to_path_buf()
+    if roots.is_empty() {
+        roots.push(path.to_path_buf());
+    }
+    roots
 }
 
-/// Walk a crate root, parse every `.rs` file, and collect defs + calls.
+/// Walk a crate (or workspace), parse every `.rs` file, collect defs + calls.
 pub fn scan_crate(root: &Path) -> anyhow::Result<Scan> {
-    let root = resolve_root(root);
+    let roots = resolve_roots(root);
     let mut scan = Scan::default();
-    for entry in walkdir::WalkDir::new(&root)
-        .into_iter()
+    for entry in roots
+        .iter()
+        .flat_map(|r| walkdir::WalkDir::new(r).into_iter())
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_file())
     {
@@ -180,25 +240,10 @@ pub fn scan_crate(root: &Path) -> anyhow::Result<Scan> {
         if path.extension().and_then(|s| s.to_str()) != Some("rs") {
             continue;
         }
-        // Skip vendored, generated, and duplicated trees. Worktrees and vendor
-        // dirs contain whole copies of the crate; counting them inflates every
-        // number and double-counts every finding.
-        let s = path.to_string_lossy();
-        const SKIP: &[&str] = &[
-            "/target/",
-            "/node_modules/",
-            "/.git/",
-            "/worktrees/",
-            "/vendor/",
-            "/.cargo/",
-            "/build/",
-            "/dist/",
-            "/temp/",
-            "/examples/",
-        ];
-        if SKIP.iter().any(|d| s.contains(d)) {
+        if skipped(path) {
             continue;
         }
+        let s = path.to_string_lossy();
         let src = match std::fs::read_to_string(path) {
             Ok(s) => s,
             Err(_) => continue,
@@ -207,8 +252,15 @@ pub fn scan_crate(root: &Path) -> anyhow::Result<Scan> {
             Ok(a) => a,
             Err(_) => continue, // unparseable file: skip, don't fail the run
         };
-        // A file under tests/ or named *_test.rs is entirely test code.
-        let file_is_test = s.contains("/tests/") || s.ends_with("_test.rs");
+        // Whole-file test code, by Rust convention: a `tests/` directory, or a
+        // file named `tests.rs` / `test.rs` / `*_test.rs` / `*_tests.rs`.
+        // Missing `src/**/tests.rs` treats every test helper in it as shipped
+        // production code, which is how you manufacture false positives.
+        let file_is_test = s.contains("/tests/")
+            || s.ends_with("/tests.rs")
+            || s.ends_with("/test.rs")
+            || s.ends_with("_test.rs")
+            || s.ends_with("_tests.rs");
         let mut v = FileVisitor {
             file: path,
             scan: &mut scan,
@@ -244,6 +296,11 @@ pub fn never_run(scan: &Scan) -> Vec<Finding> {
             continue;
         }
         if ALWAYS_LIVE.contains(&d.name.as_str()) {
+            continue;
+        }
+        // Re-exported from the crate root: it is public API, and its consumers
+        // are outside this tree.
+        if scan.reexported.contains(&d.name) {
             continue;
         }
         // A name defined more than once is ambiguous under name-based matching;
