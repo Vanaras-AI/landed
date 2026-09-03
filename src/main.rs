@@ -38,6 +38,15 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         fail_over: usize,
 
+        /// Use whole-graph reachability instead of the per-function check:
+        /// finds entire dead subsystems, not just their outermost function.
+        #[arg(long)]
+        graph: bool,
+
+        /// Emit the call graph as Graphviz DOT, unreachable nodes in red.
+        #[arg(long)]
+        dot: bool,
+
         /// Show every definition and call site recorded for one function name.
         /// Use this to check a finding, or to see why one was not reported.
         #[arg(long, value_name = "FN")]
@@ -53,6 +62,8 @@ fn main() -> anyhow::Result<()> {
             json,
             fail_over,
             explain,
+            graph,
+            dot,
         } => {
             let scan = scan::scan_crate(&path)?;
 
@@ -91,7 +102,16 @@ fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
 
-            let findings = scan::never_run(&scan);
+            if dot {
+                print!("{}", scan::to_dot(&scan));
+                return Ok(());
+            }
+
+            let findings = if graph {
+                scan::never_run_graph(&scan)
+            } else {
+                scan::never_run(&scan)
+            };
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&findings)?);

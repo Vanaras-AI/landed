@@ -19,6 +19,19 @@ pub struct FnDef {
     pub trait_impl: bool,
     /// Carries `#[allow(dead_code)]` — author already acknowledged this.
     pub allowed_dead: bool,
+    /// `pub` at its definition site. In a library crate the public surface is
+    /// an entry point: callers live outside the tree we can see.
+    pub is_pub: bool,
+    /// A test harness function (`#[test]`, `#[bench]`, …) — a root of the
+    /// test-reachable set, never of the production one.
+    pub is_test_fn: bool,
+    /// `#[no_mangle]` / `extern "C"` — callable from assembly or another
+    /// language, so it is an entry point no matter who calls it in Rust.
+    pub is_ffi: bool,
+    /// The crate `src/` directory this definition came from. Entry points are
+    /// a property of a crate, not of a workspace, so each definition has to
+    /// remember which crate it belongs to.
+    pub crate_root: PathBuf,
 }
 
 #[derive(Debug, Default, Clone, serde::Serialize)]
@@ -33,6 +46,14 @@ pub struct CallSites {
 pub struct Scan {
     pub defs: Vec<FnDef>,
     pub calls: HashMap<String, CallSites>,
+    /// The call graph: caller name -> names it invokes. Built alongside
+    /// `calls` so reachability can be computed transitively from entry
+    /// points, rather than asking each function in isolation whether anyone
+    /// mentions it. Calls made outside any function (a `static` initialiser,
+    /// a const expression) are attributed to the caller `""`.
+    pub edges: HashMap<String, std::collections::HashSet<String>>,
+    /// Every crate `src/` dir that was scanned.
+    pub crate_roots: Vec<PathBuf>,
     /// Names re-exported from the crate root (`pub use ...`). These are the
     /// crate's public API: consumers, benches and fuzz targets live outside
     /// the tree we scan, so "no in-crate caller" proves nothing about them.
@@ -107,6 +128,11 @@ struct FileVisitor<'a> {
     test_depth: usize,
     /// Depth of nested `impl Trait for Type` blocks.
     trait_depth: usize,
+    /// Enclosing function names, innermost last. A call recorded while this
+    /// is non-empty becomes a graph edge from its innermost entry.
+    fn_stack: Vec<String>,
+    /// The crate `src/` this file belongs to.
+    crate_root: PathBuf,
 }
 
 impl<'a> FileVisitor<'a> {
@@ -114,7 +140,11 @@ impl<'a> FileVisitor<'a> {
         self.test_depth > 0
     }
 
-    fn record_def(&mut self, name: String, span: Span, attrs: &[syn::Attribute]) {
+    fn record_def(&mut self, name: String, span: Span, attrs: &[syn::Attribute], is_pub: bool) {
+        let is_ffi = attrs.iter().any(|a| {
+            let t = a.to_token_stream().to_string();
+            a.path().is_ident("no_mangle") || t.contains("export_name") || t.contains("used")
+        });
         self.scan.defs.push(FnDef {
             name,
             file: self.file.to_path_buf(),
@@ -122,6 +152,10 @@ impl<'a> FileVisitor<'a> {
             in_test: self.in_test() || has_cfg_test(attrs),
             trait_impl: self.trait_depth > 0,
             allowed_dead: has_allow_dead(attrs),
+            crate_root: self.crate_root.clone(),
+            is_pub,
+            is_test_fn: attrs.iter().any(is_test_attr),
+            is_ffi,
         });
     }
 
@@ -144,7 +178,10 @@ impl<'a> FileVisitor<'a> {
                             // crediting a spurious *test* call would push a
                             // function with no real callers into the report.
                             if !self.in_test() {
-                                self.scan.calls.entry(id.to_string()).or_default().prod += 1;
+                                let caller = self.fn_stack.last().cloned().unwrap_or_default();
+                                let n = id.to_string();
+                                self.scan.edges.entry(caller).or_default().insert(n.clone());
+                                self.scan.calls.entry(n).or_default().prod += 1;
                             }
                         }
                     }
@@ -160,6 +197,13 @@ impl<'a> FileVisitor<'a> {
     fn record_call(&mut self, name: String, span: Span) {
         let in_test = self.in_test();
         let file = self.file.to_path_buf();
+        // Graph edge: whichever function we are currently inside calls `name`.
+        let caller = self.fn_stack.last().cloned().unwrap_or_default();
+        self.scan
+            .edges
+            .entry(caller)
+            .or_default()
+            .insert(name.clone());
         let entry = self.scan.calls.entry(name).or_default();
         if in_test {
             entry.test += 1;
@@ -200,7 +244,10 @@ impl<'ast, 'a> Visit<'ast> for FileVisitor<'a> {
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
         // A #[test] fn is test code even outside a cfg(test) module.
         let is_test_fn = node.attrs.iter().any(is_test_attr) || has_cfg_test(&node.attrs);
-        self.record_def(node.sig.ident.to_string(), node.sig.ident.span(), &node.attrs);
+        let is_pub = matches!(node.vis, syn::Visibility::Public(_));
+        let name = node.sig.ident.to_string();
+        self.record_def(name.clone(), node.sig.ident.span(), &node.attrs, is_pub);
+        self.fn_stack.push(name);
         if is_test_fn {
             self.test_depth += 1;
             syn::visit::visit_item_fn(self, node);
@@ -208,11 +255,16 @@ impl<'ast, 'a> Visit<'ast> for FileVisitor<'a> {
         } else {
             syn::visit::visit_item_fn(self, node);
         }
+        self.fn_stack.pop();
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        self.record_def(node.sig.ident.to_string(), node.sig.ident.span(), &node.attrs);
+        let is_pub = matches!(node.vis, syn::Visibility::Public(_));
+        let name = node.sig.ident.to_string();
+        self.record_def(name.clone(), node.sig.ident.span(), &node.attrs, is_pub);
+        self.fn_stack.push(name);
         syn::visit::visit_impl_item_fn(self, node);
+        self.fn_stack.pop();
     }
 
     fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
@@ -316,9 +368,9 @@ pub fn resolve_roots(path: &Path) -> Vec<PathBuf> {
 pub fn scan_crate(root: &Path) -> anyhow::Result<Scan> {
     let roots = resolve_roots(root);
     let mut scan = Scan::default();
-    for entry in roots
-        .iter()
-        .flat_map(|r| walkdir::WalkDir::new(r).into_iter())
+    for croot in &roots {
+    for entry in walkdir::WalkDir::new(croot)
+        .into_iter()
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_file())
     {
@@ -352,9 +404,13 @@ pub fn scan_crate(root: &Path) -> anyhow::Result<Scan> {
             scan: &mut scan,
             test_depth: usize::from(file_is_test),
             trait_depth: 0,
+            fn_stack: Vec::new(),
+            crate_root: croot.clone(),
         };
         v.visit_file(&ast);
     }
+    }
+    scan.crate_roots = roots;
     Ok(scan)
 }
 
@@ -408,4 +464,167 @@ pub fn never_run(scan: &Scan) -> Vec<Finding> {
     }
     out.sort_by(|a, b| b.test_calls.cmp(&a.test_calls));
     out
+}
+
+// ─── Call-graph reachability ──────────────────────────────────
+
+/// Roots of the production-reachable set.
+///
+/// Deliberately generous: anything that could plausibly be entered from
+/// outside the code we can see is a root, because treating a real entry point
+/// as dead would produce a false accusation.
+///
+/// - `main` — the program's entry point
+/// - `#[no_mangle]` / `extern` — callable from assembly or another language
+/// - trait impl methods — reachable through dynamic dispatch
+/// - names re-exported at the crate root — the library's public API
+/// - `""` — calls made outside any function (static initialisers, consts)
+pub fn production_roots(scan: &Scan) -> std::collections::HashSet<String> {
+    let mut roots: std::collections::HashSet<String> = std::collections::HashSet::new();
+    roots.insert(String::new());
+    roots.insert("main".into());
+
+    // Classify each crate: does it have a binary entry point of its own?
+    let is_bin_crate = |croot: &Path| -> bool {
+        croot.join("main.rs").is_file() || croot.join("bin").is_dir()
+    };
+
+    // Workspace-level question: is this thing an application or a library?
+    //
+    // An application has at least one binary. Its library crates are internal
+    // plumbing — reached through that binary, not by outside consumers — so
+    // their `pub` surface is NOT an entry point, and code nothing runs is
+    // genuinely dead.
+    //
+    // A crate with no binary anywhere is a library. Its consumers are other
+    // people's crates, which we cannot see, so its whole public API must be
+    // treated as reachable or we would accuse the entire codebase. (Observed
+    // before this rule: a 120-fn library reported 51% dead, all false.)
+    let is_application = scan.crate_roots.iter().any(|r| is_bin_crate(r));
+
+    for d in &scan.defs {
+        if d.in_test || d.is_test_fn {
+            continue;
+        }
+        let externally_reachable = if is_application {
+            // Only a genuinely external surface counts: FFI symbols and
+            // trait methods reached by dynamic dispatch.
+            d.is_ffi || d.trait_impl
+        } else {
+            d.is_ffi || d.trait_impl || d.is_pub || scan.reexported.contains(&d.name)
+        };
+        if externally_reachable {
+            roots.insert(d.name.clone());
+        }
+    }
+    roots
+}
+
+/// Was this scan of an application (has a binary) or a library?
+pub fn is_application(scan: &Scan) -> bool {
+    scan.crate_roots
+        .iter()
+        .any(|r| r.join("main.rs").is_file() || r.join("bin").is_dir())
+}
+
+/// Roots of the test-reachable set: every `#[test]`-style function, plus
+/// every function defined inside a `#[cfg(test)]` module.
+pub fn test_roots(scan: &Scan) -> std::collections::HashSet<String> {
+    scan.defs
+        .iter()
+        .filter(|d| d.is_test_fn || d.in_test)
+        .map(|d| d.name.clone())
+        .collect()
+}
+
+/// Everything reachable from `roots` by following call edges transitively.
+pub fn reachable(
+    scan: &Scan,
+    roots: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<String> {
+    let mut seen: std::collections::HashSet<String> = roots.clone();
+    let mut queue: Vec<String> = roots.iter().cloned().collect();
+    while let Some(n) = queue.pop() {
+        if let Some(callees) = scan.edges.get(&n) {
+            for c in callees {
+                if seen.insert(c.clone()) {
+                    queue.push(c.clone());
+                }
+            }
+        }
+    }
+    seen
+}
+
+/// Functions the tests can reach but the running program cannot.
+///
+/// This is the graph-wide generalisation of `never_run`: it catches an entire
+/// dead subsystem, not merely its outermost function. A helper called only by
+/// a dead function has a production call site and so looks alive to the
+/// per-function check; here it is correctly unreachable.
+pub fn never_run_graph(scan: &Scan) -> Vec<Finding> {
+    let prod = reachable(scan, &production_roots(scan));
+    let test = reachable(scan, &test_roots(scan));
+
+    let mut out = Vec::new();
+    for d in &scan.defs {
+        if d.in_test || d.is_test_fn || d.trait_impl || d.allowed_dead || d.is_ffi {
+            continue;
+        }
+        if ALWAYS_LIVE.contains(&d.name.as_str()) || scan.reexported.contains(&d.name) {
+            continue;
+        }
+        // Name-based edges cannot distinguish two functions sharing a name,
+        // so say nothing when the name is not unique in production code.
+        if scan
+            .defs
+            .iter()
+            .filter(|o| o.name == d.name && !o.in_test)
+            .count()
+            > 1
+        {
+            continue;
+        }
+        if !prod.contains(&d.name) && test.contains(&d.name) {
+            let c = scan.calls.get(&d.name);
+            out.push(Finding {
+                name: d.name.clone(),
+                file: d.file.display().to_string(),
+                line: d.line,
+                test_calls: c.map(|c| c.test).unwrap_or(0),
+                examples: c.map(|c| c.examples.clone()).unwrap_or_default(),
+            });
+        }
+    }
+    out.sort_by(|a, b| b.test_calls.cmp(&a.test_calls));
+    out
+}
+
+/// Emit the call graph in Graphviz DOT, with unreachable nodes marked.
+pub fn to_dot(scan: &Scan) -> String {
+    let prod = reachable(scan, &production_roots(scan));
+    let mut s = String::from("digraph calls {\n  rankdir=LR;\n  node [shape=box,fontsize=10];\n");
+    for d in &scan.defs {
+        if d.in_test || d.is_test_fn {
+            continue;
+        }
+        let dead = !prod.contains(&d.name);
+        s.push_str(&format!(
+            "  \"{}\" [style=filled,fillcolor=\"{}\"];\n",
+            d.name,
+            if dead { "#ffd6d6" } else { "#e8f0e8" }
+        ));
+    }
+    for (from, tos) in &scan.edges {
+        if from.is_empty() {
+            continue;
+        }
+        for to in tos {
+            if scan.defs.iter().any(|d| &d.name == to && !d.in_test) {
+                s.push_str(&format!("  \"{from}\" -> \"{to}\";\n"));
+            }
+        }
+    }
+    s.push_str("}\n");
+    s
 }
