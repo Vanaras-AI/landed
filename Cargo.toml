@@ -3,10 +3,10 @@ name = "landed"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
-description = "Find code that shipped but never runs. Verifies that work an AI agent claimed to deliver actually landed."
+description = "Find code that shipped but never runs — call-graph reachability for Rust."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Vanaras-AI/landed"
-keywords = ["static-analysis", "dead-code", "ai-agents", "verification"]
+keywords = ["static-analysis", "dead-code", "reachability", "call-graph"]
 categories = ["development-tools"]
 
 [dependencies]

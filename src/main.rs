@@ -1,10 +1,11 @@
 //! landed — find code that shipped but never runs.
 //!
-//! An AI agent writes a feature, writes its tests, and reports success. The
-//! tests pass because the agent also chose the fixtures. Nothing in production
-//! ever calls the feature. CI is green and the work is absent.
+//! A feature is written, tests are written for it, and it ships. The tests
+//! pass because whoever wrote the code also chose the fixtures. Nothing in
+//! production ever calls it, and CI stays green over an absent feature.
 //!
-//! `landed` reads the crate and reports functions whose only callers are tests.
+//! `landed` builds the crate's call graph and reports functions the tests can
+//! reach but the running program cannot.
 
 mod scan;
 
