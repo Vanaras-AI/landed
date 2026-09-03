@@ -13,4 +13,5 @@
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 
+pub mod baseline;
 pub mod scan;

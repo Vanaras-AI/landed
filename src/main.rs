@@ -7,7 +7,7 @@
 //! `landed` builds the crate's call graph and reports functions the tests can
 //! reach but the running program cannot.
 
-use landed::scan;
+use landed::{baseline, scan};
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -25,6 +25,22 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Record the current findings as accepted, so later runs report only
+    /// what is new. Write this file into the repo.
+    Baseline {
+        /// Path to the crate root (defaults to current directory).
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Baseline the whole-graph analysis rather than the per-function one.
+        #[arg(long)]
+        graph: bool,
+
+        /// Where to write it.
+        #[arg(long, value_name = "FILE")]
+        out: Option<PathBuf>,
+    },
+
     /// Scan a crate for functions that only tests ever call.
     Check {
         /// Path to the crate root (defaults to current directory).
@@ -58,6 +74,11 @@ enum Cmd {
         #[arg(long)]
         dot: bool,
 
+        /// Compare against a baseline and report only findings that are not
+        /// in it. Defaults to .landed-baseline.json beside Cargo.toml.
+        #[arg(long, value_name = "FILE", num_args = 0..=1, default_missing_value = "")]
+        baseline: Option<String>,
+
         /// Show every definition and call site recorded for one function name.
         /// Use this to check a finding, or to see why one was not reported.
         #[arg(long, value_name = "FN")]
@@ -65,9 +86,42 @@ enum Cmd {
     },
 }
 
+/// Collect the current findings as baseline entries.
+fn entries_now(scan: &scan::Scan, graph: bool, root: &std::path::Path) -> Vec<baseline::Entry> {
+    let findings = if graph {
+        scan::never_run_graph(scan)
+    } else {
+        scan::never_run(scan)
+    };
+    let mut v: Vec<baseline::Entry> = findings
+        .into_iter()
+        .map(|f| baseline::Entry {
+            name: f.name,
+            file: baseline::relative(&f.file, root),
+        })
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
+        Cmd::Baseline { path, graph, out } => {
+            let scan = scan::scan_crate(&path)?;
+            let entries = entries_now(&scan, graph, &path);
+            let mode = if graph { baseline::Mode::Graph } else { baseline::Mode::Direct };
+            let b = baseline::Baseline::new(mode, entries);
+            let file = out.unwrap_or_else(|| baseline::default_path(&path));
+            b.save(&file)?;
+            println!("wrote {} — {} finding(s) accepted", file.display(), b.accepted.len());
+            println!();
+            println!("Commit this file. Later runs with --baseline report only what is");
+            println!("new, so CI can gate on additions without demanding the backlog");
+            println!("be cleared first.");
+        }
+
         Cmd::Check {
             path,
             json,
@@ -77,6 +131,7 @@ fn main() -> anyhow::Result<()> {
             dot,
             stats,
             flat,
+            baseline: baseline_arg,
         } => {
             let scan = scan::scan_crate(&path)?;
 
@@ -147,6 +202,57 @@ fn main() -> anyhow::Result<()> {
 
             if dot {
                 print!("{}", scan::to_dot(&scan));
+                return Ok(());
+            }
+
+            if let Some(arg) = baseline_arg {
+                let file = if arg.is_empty() {
+                    baseline::default_path(&path)
+                } else {
+                    PathBuf::from(arg)
+                };
+                let base = baseline::Baseline::load(&file)?;
+                let want = if graph { baseline::Mode::Graph } else { baseline::Mode::Direct };
+                if base.mode != want {
+                    anyhow::bail!(
+                        "baseline {} was taken in {:?} mode; re-run with the matching \
+                         analysis or retake it, because the difference between the two \
+                         analyses would be reported as a change in the code",
+                        file.display(),
+                        base.mode
+                    );
+                }
+                let now = entries_now(&scan, graph, &path);
+                let cmp = baseline::compare(&base, &now);
+
+                header(&scan);
+                if !cmp.cleared.is_empty() {
+                    println!("CLEARED — {} baseline finding(s) no longer present", cmp.cleared.len());
+                    for e in cmp.cleared.iter().take(10) {
+                        println!("  {}  {}", e.name, e.file);
+                    }
+                    if cmp.cleared.len() > 10 {
+                        println!("  ... and {} more", cmp.cleared.len() - 10);
+                    }
+                    println!();
+                }
+                if cmp.added.is_empty() {
+                    println!("No new unreachable code. {} finding(s) carried from the baseline.", cmp.carried);
+                } else {
+                    println!("NEW — {} finding(s) not in the baseline", cmp.added.len());
+                    println!("{}", "─".repeat(74));
+                    for e in &cmp.added {
+                        println!("  {:32} {}", e.name, e.file);
+                    }
+                    println!("{}", "─".repeat(74));
+                    println!("  {} carried from the baseline, not shown", cmp.carried);
+                }
+                if !cmp.added.is_empty() && fail_over == 0 {
+                    std::process::exit(1);
+                }
+                if fail_over > 0 && cmp.added.len() > fail_over {
+                    std::process::exit(1);
+                }
                 return Ok(());
             }
 

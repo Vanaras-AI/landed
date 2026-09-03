@@ -78,6 +78,33 @@ landed check --graph --fail-over 0   # exit 1 on any finding, for CI
 
 `--graph` is the interesting mode. `check` alone is the conservative one.
 
+## Adopting it on a codebase that already has findings
+
+A crate that has never been analysed will produce findings on the first run —
+one produced 216. Presented as a wall, that is uninstallable: the honest
+response is to remove the tool, not to fix 216 functions.
+
+Record what is already there, and gate on what is added:
+
+```bash
+landed baseline            # writes .landed-baseline.json — commit it
+landed check --baseline    # exits 1 only on findings not in the baseline
+```
+
+The baseline names findings by function and file, never by line, so an
+unrelated edit that shifts code down a file does not resurface them. Findings
+that disappear are reported as cleared, so the backlog can be paid down
+visibly. A baseline taken with `--graph` is refused against a per-function run
+and vice versa — otherwise the difference between two analyses would be
+reported as a change in the code.
+
+In CI:
+
+```yaml
+- run: cargo install --git https://github.com/Vanaras-AI/landed
+- run: landed check --graph --baseline
+```
+
 ## What it deliberately stays quiet about
 
 False positives kill a tool that accuses, so `landed` says nothing unless it is
