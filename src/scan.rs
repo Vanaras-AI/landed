@@ -628,3 +628,22 @@ pub fn to_dot(scan: &Scan) -> String {
     s.push_str("}\n");
     s
 }
+
+/// How much of the crate is invisible to name-based matching?
+///
+/// `never_run` stays silent whenever a name is defined more than once in
+/// production, because a name-keyed graph cannot tell `A::process` from
+/// `B::process`. That is the safe direction, but it is also a blind spot, and
+/// its size should be known rather than assumed.
+pub fn ambiguity_report(scan: &Scan) -> (usize, usize) {
+    use std::collections::HashMap as M;
+    let mut counts: M<&str, usize> = M::new();
+    for d in &scan.defs {
+        if !d.in_test {
+            *counts.entry(d.name.as_str()).or_default() += 1;
+        }
+    }
+    let total = counts.values().sum();
+    let ambiguous: usize = counts.values().filter(|&&c| c > 1).sum();
+    (ambiguous, total)
+}

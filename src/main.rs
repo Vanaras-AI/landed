@@ -44,6 +44,11 @@ enum Cmd {
         #[arg(long)]
         graph: bool,
 
+        /// Report analysis coverage: how much of the crate the name-based
+        /// graph cannot see, and so stays silent about.
+        #[arg(long)]
+        stats: bool,
+
         /// Emit the call graph as Graphviz DOT, unreachable nodes in red.
         #[arg(long)]
         dot: bool,
@@ -65,6 +70,7 @@ fn main() -> anyhow::Result<()> {
             explain,
             graph,
             dot,
+            stats,
         } => {
             let scan = scan::scan_crate(&path)?;
 
@@ -100,6 +106,17 @@ fn main() -> anyhow::Result<()> {
                     "\nre-exported at crate root: {}",
                     scan.reexported.contains(&name)
                 );
+                return Ok(());
+            }
+
+            if stats {
+                let (a, t) = scan::ambiguity_report(&scan);
+                println!("production functions      {t}");
+                println!("non-unique names          {a} ({:.1}%)", a as f64 * 100.0 / t.max(1) as f64);
+                println!();
+                println!("Findings are suppressed for non-unique names, because a");
+                println!("name-keyed graph cannot tell A::process from B::process.");
+                println!("That fraction of the crate is therefore never reported on.");
                 return Ok(());
             }
 
