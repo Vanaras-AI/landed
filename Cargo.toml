@@ -1,0 +1,24 @@
+[package]
+name = "landed"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Find code that shipped but never runs. Verifies that work an AI agent claimed to deliver actually landed."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Vanaras-AI/landed"
+keywords = ["static-analysis", "dead-code", "ai-agents", "verification"]
+categories = ["development-tools"]
+
+[dependencies]
+syn = { version = "2", features = ["full", "visit", "parsing", "extra-traits"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"
+walkdir = "2"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1.0.104"
+
+[profile.release]
+opt-level = 3
+lto = true
