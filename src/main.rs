@@ -131,6 +131,20 @@ fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
 
+            if stats {
+                let (ambiguous, total) = scan::ambiguity_report(&scan);
+                println!("production functions      {total}");
+                println!(
+                    "non-unique names          {ambiguous} ({:.1}%)",
+                    ambiguous as f64 * 100.0 / total.max(1) as f64
+                );
+                println!();
+                println!("Findings are suppressed for non-unique names, because a");
+                println!("name-keyed graph cannot tell A::process from B::process.");
+                println!("That share of the crate is never reported on, either way.");
+                return Ok(());
+            }
+
             if dot {
                 print!("{}", scan::to_dot(&scan));
                 return Ok(());
