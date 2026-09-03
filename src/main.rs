@@ -7,7 +7,7 @@
 //! `landed` builds the crate's call graph and reports functions the tests can
 //! reach but the running program cannot.
 
-mod scan;
+use landed::scan;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;

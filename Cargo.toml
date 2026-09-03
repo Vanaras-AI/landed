@@ -8,6 +8,8 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/Vanaras-AI/landed"
 keywords = ["static-analysis", "dead-code", "reachability", "call-graph"]
 categories = ["development-tools"]
+# Fixture crates are analysis input, not workspace members.
+exclude = ["fixtures"]
 
 [dependencies]
 syn = { version = "2", features = ["full", "visit", "parsing", "extra-traits"] }
