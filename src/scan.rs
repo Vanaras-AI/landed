@@ -38,6 +38,12 @@ pub struct Scan {
     pub reexported: HashSet<String>,
     /// Best precision the frontend that produced this could offer.
     pub precision: Precision,
+    /// How many findings the nominal tier reported, when a more precise tier
+    /// is running. A precise tier should mostly *remove* findings by settling
+    /// ambiguity; if it adds many, the likelier cause is a call form its
+    /// parser did not read than a sudden abundance of dead code, and the
+    /// report says so rather than presenting the number as fact.
+    pub nominal_findings: Option<usize>,
 }
 
 impl Default for Scan {
@@ -51,6 +57,7 @@ impl Default for Scan {
             config: crate::config::Config::default(),
             reexported: HashSet::new(),
             precision: Precision::Nominal,
+            nominal_findings: None,
         }
     }
 }
@@ -65,25 +72,55 @@ impl Scan {
         let mut calls: HashMap<String, CallSites> = HashMap::new();
         let mut edges: HashMap<String, HashSet<String>> = HashMap::new();
 
-        for e in &ex.edges {
-            edges
-                .entry(e.from.to_string())
-                .or_default()
-                .insert(e.to.to_string());
+        // An edge whose target the frontend could not qualify says only "some
+        // function of this name was called". If definitions are keyed more
+        // precisely than that — as they are once MIR has promoted them — such
+        // an edge would reach none of them, and every one would be stranded
+        // and reported dead.
+        //
+        // So an unqualified target credits every definition sharing its name.
+        // That over-approximates liveness, which removes findings; the
+        // alternative invents them, and this analysis is built to fail the
+        // first way.
+        let mut by_name: HashMap<&str, Vec<String>> = HashMap::new();
+        for d in &ex.definitions {
+            by_name.entry(d.name()).or_default().push(d.key());
+        }
+        let known: HashSet<String> = ex.definitions.iter().map(|d| d.key()).collect();
+        let targets_of = |to: &crate::ir::SymbolId| -> Vec<String> {
+            let exact = to.to_string();
+            // A qualifier only helps if it names a definition we actually
+            // hold. A frontend may qualify with something the definition side
+            // never saw — a crate name on a cross-target call, for one — and
+            // an edge that matches nothing strands its callee.
+            if to.is_qualified() && known.contains(&exact) {
+                return vec![exact];
+            }
+            match by_name.get(to.name.as_str()) {
+                Some(keys) if !keys.is_empty() => keys.clone(),
+                _ => vec![exact],
+            }
+        };
 
-            let entry = calls.entry(e.to.to_string()).or_default();
-            if e.in_test {
-                if e.kind.can_create_finding() {
-                    entry.test += 1;
-                    // A frontend that resolves calls precisely may not know
-                    // where they were written. An absent location is omitted
-                    // rather than printed as ":0".
-                    if entry.examples.len() < 3 && e.line > 0 {
-                        entry.examples.push(format!("{}:{}", e.file.display(), e.line));
+        for e in &ex.edges {
+            let from = e.from.to_string();
+            for target in targets_of(&e.to) {
+                edges.entry(from.clone()).or_default().insert(target.clone());
+
+                let entry = calls.entry(target).or_default();
+                if e.in_test {
+                    if e.kind.can_create_finding() {
+                        entry.test += 1;
+                        // A frontend that resolves calls precisely may not
+                        // know where they were written. An absent location is
+                        // omitted rather than printed as ":0".
+                        if entry.examples.len() < 3 && e.line > 0 {
+                            entry.examples.push(format!("{}:{}", e.file.display(), e.line));
+                        }
                     }
+                } else {
+                    entry.prod += 1;
                 }
-            } else {
-                entry.prod += 1;
             }
         }
 
@@ -110,6 +147,12 @@ pub fn scan_crate_with(root: &Path, tier: crate::frontend::Tier) -> anyhow::Resu
     let mut scan = Scan::from_extract(ex, crate::frontend::precision(tier));
     scan.config = crate::config::Config::load(root).unwrap_or_default();
     scan.workspace = crate::targets::discover(root);
+
+    if tier != crate::frontend::Tier::Default {
+        if let Ok(base) = scan_crate(root) {
+            scan.nominal_findings = Some(never_run_graph(&base).len());
+        }
+    }
     Ok(scan)
 }
 

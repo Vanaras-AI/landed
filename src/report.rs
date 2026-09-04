@@ -23,6 +23,10 @@ pub struct Summary {
     pub confident: usize,
     pub uncertain: usize,
     pub regions: usize,
+    /// Findings the nominal tier reported, when a more precise tier ran.
+    /// A large increase indicates unparsed call forms rather than dead code.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nominal_findings: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -48,6 +52,7 @@ fn summarize(scan: &Scan, findings: &[Finding], regions: usize) -> Summary {
         confident: findings.iter().filter(|f| f.confidence == Confidence::High).count(),
         uncertain: findings.iter().filter(|f| f.confidence == Confidence::Medium).count(),
         regions,
+        nominal_findings: scan.nominal_findings,
     }
 }
 

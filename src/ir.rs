@@ -41,37 +41,56 @@ pub struct SymbolId {
     /// Defining type for a method — `A` in `A::process`. `None` when the
     /// frontend cannot see it.
     pub self_ty: Option<String>,
-    /// Owning crate, for workspace-wide analysis.
-    pub krate: Option<String>,
+    /// Qualifying path — the module a free function lives in, as the frontend
+    /// resolved it. `alpha` in `alpha::helper`. Distinguishes two same-named
+    /// functions in different modules, which is otherwise the largest source
+    /// of identity collision after methods.
+    pub path: Option<String>,
 }
 
 impl SymbolId {
     /// A name and nothing else — everything a syntactic frontend can promise.
     pub fn nominal(name: impl Into<String>) -> Self {
-        Self { name: name.into(), self_ty: None, krate: None }
+        Self { name: name.into(), self_ty: None, path: None }
     }
 
     /// A method whose receiver type is known.
     pub fn typed(name: impl Into<String>, self_ty: impl Into<String>) -> Self {
-        Self { name: name.into(), self_ty: Some(self_ty.into()), krate: None }
+        Self { name: name.into(), self_ty: Some(self_ty.into()), path: None }
+    }
+
+    /// A free function qualified by the module it lives in.
+    pub fn in_module(name: impl Into<String>, path: impl Into<String>) -> Self {
+        Self { name: name.into(), self_ty: None, path: Some(path.into()) }
     }
 
     /// The precision this id carries on its own, before any frontend claim.
+    /// The precision this id carries on its own.
+    ///
+    /// Never `Resolved`: that would assert global uniqueness, and no frontend
+    /// here can guarantee it. A qualifier narrows identity; it does not prove
+    /// there is exactly one such symbol in the program.
     pub fn precision(&self) -> Precision {
-        match (&self.self_ty, &self.krate) {
-            (Some(_), Some(_)) => Precision::Resolved,
-            (Some(_), None) => Precision::Typed,
-            _ => Precision::Nominal,
+        if self.self_ty.is_some() || self.path.is_some() {
+            Precision::Typed
+        } else {
+            Precision::Nominal
         }
+    }
+
+    /// Is this id qualified beyond a bare name?
+    pub fn is_qualified(&self) -> bool {
+        self.self_ty.is_some() || self.path.is_some()
     }
 }
 
 impl std::fmt::Display for SymbolId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match (&self.krate, &self.self_ty) {
-            (Some(k), Some(t)) => write!(f, "{k}::{t}::{}", self.name),
+        match (&self.path, &self.self_ty) {
+            (Some(p), Some(t)) => write!(f, "{p}::{t}::{}", self.name),
             (None, Some(t)) => write!(f, "{t}::{}", self.name),
-            _ => write!(f, "{}", self.name),
+            (Some(p), None) => write!(f, "{p}::{}", self.name),
+            (None, None) => write!(f, "{}", self.name),
         }
     }
 }
@@ -137,6 +156,11 @@ pub struct Definition {
     /// The crate `src/` this came from. Entry points are a property of a
     /// crate, not of a workspace.
     pub crate_root: PathBuf,
+    /// Module path the definition sits in, as source structure implies —
+    /// `alpha` for `mod alpha { fn helper() }`. Metadata rather than identity,
+    /// for the same reason as `self_ty`: the default frontend knows it at a
+    /// definition but not at a call site.
+    pub module: Option<String>,
     /// Defining type, when the frontend saw one. Metadata rather than
     /// identity: the default frontend knows the type at a *definition* but
     /// not at a *call site*, so folding it into the id would stop the two

@@ -62,6 +62,7 @@ impl Frontend for SynFrontend {
                     trait_depth: 0,
                     fn_stack: Vec::new(),
                     impl_ty: None,
+                    mod_stack: file_module_path(path, croot),
                     crate_root: croot.clone(),
                 };
                 v.visit_file(&ast);
@@ -141,6 +142,10 @@ struct FileVisitor<'a> {
     trait_depth: usize,
     /// Self type of the innermost `impl` block, when it is a plain path.
     impl_ty: Option<String>,
+    /// Enclosing `mod` names, outermost first, including the module this file
+    /// itself is. Lets a definition be told apart from a same-named one
+    /// elsewhere in the crate.
+    mod_stack: Vec<String>,
     /// Enclosing function names, innermost last. A call recorded while this is
     /// non-empty becomes a graph edge from its innermost entry.
     fn_stack: Vec<String>,
@@ -174,6 +179,7 @@ impl<'a> FileVisitor<'a> {
             is_test_fn: attrs.iter().any(is_test_attr),
             is_ffi,
             self_ty: self.impl_ty.clone(),
+            module: (!self.mod_stack.is_empty()).then(|| self.mod_stack.join("::")),
         });
     }
 
@@ -228,7 +234,9 @@ impl<'ast, 'a> Visit<'ast> for FileVisitor<'a> {
         if is_test {
             self.test_depth += 1;
         }
+        self.mod_stack.push(node.ident.to_string());
         syn::visit::visit_item_mod(self, node);
+        self.mod_stack.pop();
         if is_test {
             self.test_depth -= 1;
         }
@@ -324,6 +332,26 @@ impl<'ast, 'a> Visit<'ast> for FileVisitor<'a> {
         self.record_edge(node.method.to_string(), span, EdgeKind::MethodCall);
         syn::visit::visit_expr_method_call(self, node);
     }
+}
+
+/// The module path a file defines, from its position under the crate root.
+/// `src/alpha.rs` -> `["alpha"]`, `src/a/b.rs` -> `["a", "b"]`, and the crate
+/// roots `lib.rs` / `main.rs` -> `[]`.
+fn file_module_path(file: &Path, croot: &Path) -> Vec<String> {
+    let rel = match file.strip_prefix(croot) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let mut parts: Vec<String> = rel
+        .components()
+        .filter_map(|c| c.as_os_str().to_str().map(str::to_string))
+        .collect();
+    let last = parts.pop().unwrap_or_default();
+    let stem = last.trim_end_matches(".rs");
+    if !matches!(stem, "lib" | "main" | "mod") {
+        parts.push(stem.to_string());
+    }
+    parts
 }
 
 // ─── file discovery ───────────────────────────────────────────

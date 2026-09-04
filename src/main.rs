@@ -344,6 +344,7 @@ fn report(scan: &scan::Scan, findings: &[scan::Finding]) {
         return;
     }
 
+    precision_caveat(scan, findings.len());
     println!("NEVER RUN — defined in production, called only by tests");
     println!("{}", "─".repeat(78));
 
@@ -365,6 +366,26 @@ fn report(scan: &scan::Scan, findings: &[scan::Finding]) {
 }
 
 /// Header shared by every report: what was scanned, and what could not be.
+/// Precise mode should mostly *remove* findings, by settling names the
+/// nominal tier declined to judge. When it adds many instead, the likelier
+/// explanation is a call form its parser did not read than a sudden abundance
+/// of dead code — so the report says so rather than presenting the number as
+/// fact.
+fn precision_caveat(scan: &scan::Scan, found: usize) {
+    let Some(nominal) = scan.nominal_findings else { return };
+    if found <= nominal.saturating_add(nominal / 5).max(nominal + 2) {
+        return;
+    }
+    println!("CAUTION — precise mode reports {found} findings; the default reports {nominal}.");
+    println!("  This tier resolves identity from the compiler's human-readable MIR");
+    println!("  dump. A call form its parser does not recognise is a call it does not");
+    println!("  see, and everything that call reached then looks unreachable. A large");
+    println!("  increase is more likely that than newly discovered dead code.");
+    println!("  Treat the additions as leads, verify with --explain, and trust the");
+    println!("  default tier where the two disagree.");
+    println!();
+}
+
 fn header(scan: &scan::Scan) {
     let prod = scan.defs.iter().filter(|d| !d.in_test).count();
     let (ambiguous, total) = scan::ambiguity_report(scan);
@@ -401,6 +422,7 @@ fn report_regions(
     root: &std::path::Path,
 ) {
     header(scan);
+    precision_caveat(scan, total);
 
     if regions.is_empty() {
         println!("  Everything is reachable from production entry points.");

@@ -91,16 +91,22 @@ silence covers 38–43% of a real codebase, reported by `--stats`.
 landed check --graph --precise    # needs nightly and a crate that compiles
 ```
 
-resolves calls through the compiler instead, which cuts ambiguity by roughly a
-third on real crates — 34.8% to 16.8% on one, 16.5% to 6.2% on another. It
-does not close the gap entirely: MIR names a method by its receiver type but a
-free function by bare identifier, so two same-named functions in different
-modules stay indistinguishable. What remains is still reported rather than
-hidden.
+resolves calls through the compiler instead. It distinguishes same-named
+symbols the default cannot — `A::process` from `B::process`, `alpha::helper`
+from `beta::helper` — but on real crates it settles only a few percent of the
+total ambiguity, because promoting an identity requires a correspondence
+between what MIR printed and what syn recorded, and where that cannot be
+established the symbol stays nominal rather than being promoted on a guess.
 
 It never falls back. Missing nightly, a crate that does not compile, or a path
 that is not a cargo project are each reported with what to do — a mode whose
 purpose is precision must not quietly answer with less.
+
+**It is not yet a CI gate.** On large crates it over-reports, because it reads
+a dump the compiler prints for humans and a call form its parser misses is a
+call it cannot see. It compares itself against the default tier and says so
+when the two disagree. Gate on the default; use `--precise` to investigate what
+the default declined to judge.
 
 See [`docs/precise-mode.md`](docs/precise-mode.md).
 
