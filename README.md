@@ -74,6 +74,7 @@ landed check --dot | dot -Tsvg   # call graph, unreachable nodes in red
 landed check --explain my_fn     # every definition and call site for one name
 landed check --json              # versioned JSON envelope
 landed check --format github     # annotations that land on the PR diff
+landed check --format sarif      # SARIF 2.1.0 for code scanning
 landed check --graph --fail-over 0   # exit 1 on any finding, for CI
 ```
 
@@ -92,6 +93,11 @@ landed baseline            # writes .landed-baseline.json — commit it
 landed check --baseline    # exits 1 only on findings not in the baseline
 ```
 
+A baseline records which analysis produced it — tool version and config — and
+says so when that no longer matches. Findings move when the analyzer changes,
+not only when the code does, and a baseline compared across that boundary
+reports the tool's own diff as if it were yours.
+
 The baseline names findings by function and file, never by line, so an
 unrelated edit that shifts code down a file does not resurface them. Findings
 that disappear are reported as cleared, so the backlog can be paid down
@@ -105,6 +111,15 @@ In CI, with annotations on the diff rather than in log output nobody opens:
 - run: cargo install --git https://github.com/Vanaras-AI/landed
 - run: landed check --graph --baseline
 - run: landed check --graph --format github    # annotate the source lines
+```
+
+For GitHub code scanning, emit SARIF and upload it — findings then reach the
+Security tab and are tracked across runs rather than living in one job's log:
+
+```yaml
+- run: landed check --graph --format sarif > landed.sarif
+- uses: github/codeql-action/upload-sarif@v3
+  with: { sarif_file: landed.sarif }
 ```
 
 Confident findings annotate as `warning`; uncertain ones as `notice`, because
@@ -170,17 +185,31 @@ never to **create** one. Over-count calls and you miss a bug. Over-count
 test-ness and you accuse working code — and after two false accusations nobody
 runs your tool again.
 
+## Design notes
+
+- [`docs/resolution-spike.md`](docs/resolution-spike.md) — measured comparison
+  of ra_ap_hir, rustdoc JSON and MIR as resolution frontends, and why the
+  answer is two tiers rather than a migration
+- [`docs/symbol-ir.md`](docs/symbol-ir.md) — the symbol IR that keeps the
+  frontend out of the analysis layer
+- [`docs/semantic-reachability.md`](docs/semantic-reachability.md) — what it
+  would take to find code that is called but can never act
+
 ## Limits
 
 - **Rust only.**
 - **Edges are matched by name**, not resolved by type. A method reached only
   through a generic bound may be reported. Every finding names a file and line,
   and `--explain` shows the whole picture for one symbol.
-- **Entry points are a model, not a fact.** A workspace containing any binary is
-  treated as an application whose library crates are internal; a workspace with
-  no binary is a library whose entire public API is an entry point. Get this
-  wrong and the tool either accuses everything or nothing — both happened during
-  development.
+- **Entry points are a model, not a fact.** Crate layout comes from `cargo
+  metadata` where cargo can answer — targets, kinds and source paths, so
+  tests, benches and examples are excluded by cargo's own classification
+  rather than by matching path names. Where cargo cannot answer the tool falls
+  back to directory shape. An application (any `[[bin]]`) treats its library
+  crates as internal; a crate with no binary is a library whose whole public
+  API is an entry point. Get this wrong and the tool accuses everything or
+  nothing — both happened during development. `landed.toml` exists for the
+  cases the model still gets wrong.
 - It finds code nothing *calls*. It does not yet find code that is called but
   can never act — the `confidence: 0.0` case above needs type-aware field
   analysis, which is the next check.

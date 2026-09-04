@@ -41,6 +41,49 @@ pub struct Entry {
     pub file: String,
 }
 
+/// Identifies the analysis that produced a baseline.
+///
+/// Findings move when the analyzer changes, not only when the code does. A
+/// baseline taken before a suppression rule was added will report the newly
+/// suppressed functions as "cleared" and anything the new rule surfaces as
+/// "new" — an audit of the tool's own diff, presented as if the code had
+/// changed. Recording what produced it lets that be said out loud.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Fingerprint {
+    /// Tool version. Analysis rules change between releases.
+    pub tool_version: String,
+    /// Declared roots and ignores, sorted. Editing landed.toml changes what
+    /// is reachable, so a baseline taken under different config is stale.
+    pub config_digest: String,
+}
+
+impl Fingerprint {
+    pub fn of(config: &crate::config::Config) -> Self {
+        let mut parts: Vec<String> = config
+            .roots
+            .iter()
+            .map(|r| format!("r:{r}"))
+            .chain(config.ignore.iter().map(|i| format!("i:{i}")))
+            .collect();
+        parts.sort();
+        Self {
+            tool_version: env!("CARGO_PKG_VERSION").to_string(),
+            config_digest: digest(&parts.join("\n")),
+        }
+    }
+}
+
+/// FNV-1a. Not cryptographic — this detects an accidental mismatch, not a
+/// forged one, and a hash dependency for that would be unearned.
+fn digest(s: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Baseline {
     /// Schema version. Present so a future format change can be detected
@@ -48,17 +91,58 @@ pub struct Baseline {
     pub version: u32,
     pub created: String,
     pub mode: Mode,
+    /// What produced it. Absent in files written before this field existed,
+    /// which is itself worth reporting.
+    #[serde(default)]
+    pub fingerprint: Option<Fingerprint>,
     /// Sorted, so the file has a stable diff in review.
     pub accepted: BTreeSet<Entry>,
 }
 
 impl Baseline {
     pub fn new(mode: Mode, entries: impl IntoIterator<Item = Entry>) -> Self {
+        Self::with_fingerprint(mode, entries, None)
+    }
+
+    pub fn with_fingerprint(
+        mode: Mode,
+        entries: impl IntoIterator<Item = Entry>,
+        fingerprint: Option<Fingerprint>,
+    ) -> Self {
         Self {
             version: 1,
             created: chrono_now(),
             mode,
+            fingerprint,
             accepted: entries.into_iter().collect(),
+        }
+    }
+
+    /// Why this baseline may no longer describe the same analysis.
+    ///
+    /// Returned rather than enforced: a stale baseline is usually still
+    /// useful, and refusing to run would be worse than saying so.
+    pub fn staleness(&self, now: &Fingerprint) -> Option<String> {
+        match &self.fingerprint {
+            None => Some(
+                "taken before baselines recorded which analysis produced them, \
+                 so drift cannot be detected"
+                    .into(),
+            ),
+            Some(f) if f == now => None,
+            Some(f) => {
+                let mut why = Vec::new();
+                if f.tool_version != now.tool_version {
+                    why.push(format!(
+                        "taken with landed {}, running {}",
+                        f.tool_version, now.tool_version
+                    ));
+                }
+                if f.config_digest != now.config_digest {
+                    why.push("landed.toml has changed since it was taken".to_string());
+                }
+                Some(why.join("; "))
+            }
         }
     }
 

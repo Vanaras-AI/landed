@@ -74,8 +74,8 @@ enum Cmd {
         #[arg(long)]
         dot: bool,
 
-        /// Output format: text (default), json, or github (workflow commands
-        /// that annotate the source line in a pull request).
+        /// Output format: text (default), json, github (workflow commands
+        /// that annotate the source line), or sarif (code scanning).
         #[arg(long, value_name = "FMT", default_value = "text")]
         format: String,
 
@@ -117,7 +117,8 @@ fn main() -> anyhow::Result<()> {
             let scan = scan::scan_crate(&path)?;
             let entries = entries_now(&scan, graph, &path);
             let mode = if graph { baseline::Mode::Graph } else { baseline::Mode::Direct };
-            let b = baseline::Baseline::new(mode, entries);
+            let fp = baseline::Fingerprint::of(&scan.config);
+            let b = baseline::Baseline::with_fingerprint(mode, entries, Some(fp));
             let file = out.unwrap_or_else(|| baseline::default_path(&path));
             b.save(&file)?;
             println!("wrote {} — {} finding(s) accepted", file.display(), b.accepted.len());
@@ -233,6 +234,13 @@ fn main() -> anyhow::Result<()> {
                 let cmp = baseline::compare(&base, &now);
 
                 header(&scan);
+                if let Some(why) = base.staleness(&baseline::Fingerprint::of(&scan.config)) {
+                    println!("STALE BASELINE — {why}");
+                    println!("  Findings can move because the analysis changed, not because the");
+                    println!("  code did. Re-take it with `landed baseline` once you have read");
+                    println!("  what follows.");
+                    println!();
+                }
                 if !cmp.cleared.is_empty() {
                     println!("CLEARED — {} baseline finding(s) no longer present", cmp.cleared.len());
                     for e in cmp.cleared.iter().take(10) {
@@ -274,6 +282,10 @@ fn main() -> anyhow::Result<()> {
                         serde_json::to_string_pretty(&report::grouped(&scan, &regions))?
                     ),
                     "github" => print!("{}", report::github_regions(&regions, &path)),
+                    "sarif" => println!(
+                        "{}",
+                        serde_json::to_string_pretty(&report::sarif(&[], Some(&regions), &path))?
+                    ),
                     _ => report_regions(&scan, &regions, total, &path),
                 }
                 if fail_over > 0 && total > fail_over {
@@ -294,6 +306,10 @@ fn main() -> anyhow::Result<()> {
                     serde_json::to_string_pretty(&report::flat(&scan, &findings, graph))?
                 ),
                 "github" => print!("{}", report::github(&findings, &path)),
+                "sarif" => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report::sarif(&findings, None, &path))?
+                ),
                 _ => report(&scan, &findings),
             }
 

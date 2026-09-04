@@ -54,6 +54,9 @@ pub struct Scan {
     pub edges: HashMap<String, std::collections::HashSet<String>>,
     /// Every crate `src/` dir that was scanned.
     pub crate_roots: Vec<PathBuf>,
+    /// Crate layout as cargo reports it. Empty when cargo could not answer,
+    /// in which case directory heuristics apply.
+    pub workspace: crate::targets::Workspace,
     /// Project configuration: developer-declared roots and ignores.
     pub config: crate::config::Config,
     /// Names re-exported from the crate root (`pub use ...`). These are the
@@ -346,6 +349,15 @@ fn skipped(p: &Path) -> bool {
 /// vendored copies and unrelated nested projects, so instead we locate every
 /// crate the repo owns and scan each one's `src/`.
 pub fn resolve_roots(path: &Path) -> Vec<PathBuf> {
+    // Cargo knows exactly which files it compiles, including targets declared
+    // in the manifest that live nowhere the convention would predict.
+    let ws = crate::targets::discover(path);
+    if ws.from_cargo {
+        let dirs = ws.production_source_dirs();
+        if !dirs.is_empty() {
+            return dirs;
+        }
+    }
     let mut roots = Vec::new();
     for entry in walkdir::WalkDir::new(path)
         .max_depth(4)
@@ -414,6 +426,7 @@ pub fn scan_crate(root: &Path) -> anyhow::Result<Scan> {
     }
     scan.crate_roots = roots;
     scan.config = crate::config::Config::load(root).unwrap_or_default();
+    scan.workspace = crate::targets::discover(root);
     Ok(scan)
 }
 
@@ -525,7 +538,11 @@ pub fn production_roots(scan: &Scan) -> std::collections::HashSet<String> {
     // people's crates, which we cannot see, so its whole public API must be
     // treated as reachable or we would accuse the entire codebase. (Observed
     // before this rule: a 120-fn library reported 51% dead, all false.)
-    let is_application = scan.crate_roots.iter().any(|r| is_bin_crate(r));
+    let is_application = if scan.workspace.from_cargo {
+        scan.workspace.is_application()
+    } else {
+        scan.crate_roots.iter().any(|r| is_bin_crate(r))
+    };
 
     for d in &scan.defs {
         if d.in_test || d.is_test_fn {
