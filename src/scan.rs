@@ -1,39 +1,18 @@
-//! AST scan: collect function definitions and call sites, classified by
-//! whether they live in production code or test code.
+//! Analysis over the frontend-independent IR.
+//!
+//! Nothing here knows how a definition or an edge was obtained — only how far
+//! it can be trusted. Adding a frontend must not require editing this file.
 
-use proc_macro2::Span;
-use quote::ToTokens;
-use std::collections::HashMap;
+use crate::ir::{Definition, Extract, Precision};
+use crate::targets::Workspace;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use syn::visit::Visit;
 
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct FnDef {
-    pub name: String,
-    pub file: PathBuf,
-    pub line: usize,
-    /// Defined inside a `#[cfg(test)]` module.
-    pub in_test: bool,
-    /// Method of a trait impl (`impl Trait for Type`) — reachable via dynamic
-    /// dispatch, so absence of a direct call site proves nothing.
-    pub trait_impl: bool,
-    /// Carries `#[allow(dead_code)]` — author already acknowledged this.
-    pub allowed_dead: bool,
-    /// `pub` at its definition site. In a library crate the public surface is
-    /// an entry point: callers live outside the tree we can see.
-    pub is_pub: bool,
-    /// A test harness function (`#[test]`, `#[bench]`, …) — a root of the
-    /// test-reachable set, never of the production one.
-    pub is_test_fn: bool,
-    /// `#[no_mangle]` / `extern "C"` — callable from assembly or another
-    /// language, so it is an entry point no matter who calls it in Rust.
-    pub is_ffi: bool,
-    /// The crate `src/` directory this definition came from. Entry points are
-    /// a property of a crate, not of a workspace, so each definition has to
-    /// remember which crate it belongs to.
-    pub crate_root: PathBuf,
-}
+/// Kept as an alias so consumers that spoke of `FnDef` still compile; the IR
+/// name is the real one.
+pub type FnDef = Definition;
 
+/// Call sites for one symbol, split by context.
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct CallSites {
     pub prod: usize,
@@ -42,392 +21,98 @@ pub struct CallSites {
     pub examples: Vec<String>,
 }
 
-#[derive(Default)]
+/// A crate, analysed.
 pub struct Scan {
-    pub defs: Vec<FnDef>,
+    pub defs: Vec<Definition>,
+    /// Aggregate call counts per symbol, derived from the edges.
     pub calls: HashMap<String, CallSites>,
-    /// The call graph: caller name -> names it invokes. Built alongside
-    /// `calls` so reachability can be computed transitively from entry
-    /// points, rather than asking each function in isolation whether anyone
-    /// mentions it. Calls made outside any function (a `static` initialiser,
-    /// a const expression) are attributed to the caller `""`.
-    pub edges: HashMap<String, std::collections::HashSet<String>>,
-    /// Every crate `src/` dir that was scanned.
+    /// Adjacency: caller name -> names it invokes.
+    pub edges: HashMap<String, HashSet<String>>,
+    /// Every crate `src/` dir that was read.
     pub crate_roots: Vec<PathBuf>,
-    /// Crate layout as cargo reports it. Empty when cargo could not answer,
-    /// in which case directory heuristics apply.
-    pub workspace: crate::targets::Workspace,
-    /// Project configuration: developer-declared roots and ignores.
+    /// Crate layout as cargo reports it.
+    pub workspace: Workspace,
+    /// Developer-declared roots and ignores.
     pub config: crate::config::Config,
-    /// Names re-exported from the crate root (`pub use ...`). These are the
-    /// crate's public API: consumers, benches and fuzz targets live outside
-    /// the tree we scan, so "no in-crate caller" proves nothing about them.
-    pub reexported: std::collections::HashSet<String>,
+    /// Names re-exported at a crate root.
+    pub reexported: HashSet<String>,
+    /// Best precision the frontend that produced this could offer.
+    pub precision: Precision,
 }
 
-/// Strip string literals from a token dump, so words inside doc comments and
-/// string arguments cannot be mistaken for identifiers.
-fn tokens_without_strings(a: &syn::Attribute) -> String {
-    let s = a.to_token_stream().to_string();
-    let mut out = String::with_capacity(s.len());
-    let mut in_str = false;
-    let mut prev_escape = false;
-    for c in s.chars() {
-        match c {
-            '"' if !prev_escape => in_str = !in_str,
-            _ if !in_str => out.push(c),
-            _ => {}
+impl Default for Scan {
+    fn default() -> Self {
+        Self {
+            defs: Vec::new(),
+            calls: HashMap::new(),
+            edges: HashMap::new(),
+            crate_roots: Vec::new(),
+            workspace: Workspace::default(),
+            config: crate::config::Config::default(),
+            reexported: HashSet::new(),
+            precision: Precision::Nominal,
         }
-        prev_escape = c == '\\' && !prev_escape;
     }
-    out
 }
 
-/// Is `test` present as a bare identifier (not inside a string)?
-fn mentions_test_ident(s: &str) -> bool {
-    s.split(|c: char| !c.is_alphanumeric() && c != '_')
-        .any(|w| w == "test")
-}
+impl Scan {
+    /// Fold a frontend's output into the analysable form.
+    ///
+    /// Edge kinds are honoured here, once, rather than at each use: a macro
+    /// token match may raise a production count — which can only ever remove
+    /// a finding — but never a test count, which could create one.
+    pub fn from_extract(ex: Extract, precision: Precision) -> Self {
+        let mut calls: HashMap<String, CallSites> = HashMap::new();
+        let mut edges: HashMap<String, HashSet<String>> = HashMap::new();
 
-/// Does this attribute list contain `#[cfg(test)]`?
-///
-/// Must not match `#[cfg(feature = "fastest")]`, so string literals are
-/// stripped and `test` is matched as a whole identifier.
-fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
-    attrs
-        .iter()
-        .any(|a| a.path().is_ident("cfg") && mentions_test_ident(&tokens_without_strings(a)))
-}
+        for e in &ex.edges {
+            edges
+                .entry(e.from.name.clone())
+                .or_default()
+                .insert(e.to.name.clone());
 
-/// Is this a test harness attribute — `#[test]`, `#[tokio::test]`, `#[bench]`,
-/// `#[rstest]`, `#[proptest]`?
-///
-/// Checked by attribute *path*, never by substring: doc comments are
-/// attributes too, so a function documented as "a test hook" is not a test.
-fn is_test_attr(a: &syn::Attribute) -> bool {
-    let last = match a.path().segments.last() {
-        Some(s) => s.ident.to_string(),
-        None => return false,
-    };
-    matches!(
-        last.as_str(),
-        "test" | "bench" | "rstest" | "proptest" | "quickcheck" | "test_case"
-    )
-}
-
-fn has_allow_dead(attrs: &[syn::Attribute]) -> bool {
-    attrs.iter().any(|a| {
-        let s = a.to_token_stream().to_string();
-        a.path().is_ident("allow") && (s.contains("dead_code") || s.contains("unused"))
-    })
-}
-
-fn line_of(span: Span) -> usize {
-    span.start().line
-}
-
-struct FileVisitor<'a> {
-    file: &'a Path,
-    scan: &'a mut Scan,
-    /// Depth of nested `#[cfg(test)]` modules we are currently inside.
-    test_depth: usize,
-    /// Depth of nested `impl Trait for Type` blocks.
-    trait_depth: usize,
-    /// Enclosing function names, innermost last. A call recorded while this
-    /// is non-empty becomes a graph edge from its innermost entry.
-    fn_stack: Vec<String>,
-    /// The crate `src/` this file belongs to.
-    crate_root: PathBuf,
-}
-
-impl<'a> FileVisitor<'a> {
-    fn in_test(&self) -> bool {
-        self.test_depth > 0
-    }
-
-    fn record_def(&mut self, name: String, span: Span, attrs: &[syn::Attribute], is_pub: bool) {
-        let is_ffi = attrs.iter().any(|a| {
-            let t = a.to_token_stream().to_string();
-            a.path().is_ident("no_mangle") || t.contains("export_name") || t.contains("used")
-        });
-        self.scan.defs.push(FnDef {
-            name,
-            file: self.file.to_path_buf(),
-            line: line_of(span),
-            in_test: self.in_test() || has_cfg_test(attrs),
-            trait_impl: self.trait_depth > 0,
-            allowed_dead: has_allow_dead(attrs),
-            crate_root: self.crate_root.clone(),
-            is_pub,
-            is_test_fn: attrs.iter().any(is_test_attr),
-            is_ffi,
-        });
-    }
-
-    /// Walk a macro's token stream, recording `ident (` as a call.
-    fn record_tokens(&mut self, ts: proc_macro2::TokenStream) {
-        use proc_macro2::TokenTree;
-        let mut prev: Option<proc_macro2::Ident> = None;
-        for tt in ts {
-            match tt {
-                TokenTree::Ident(id) => {
-                    prev = Some(id);
-                }
-                TokenTree::Group(g) => {
-                    if g.delimiter() == proc_macro2::Delimiter::Parenthesis {
-                        if let Some(id) = prev.take() {
-                            // Only ever record these as PRODUCTION calls, and
-                            // only from production context. Token matching is
-                            // an over-approximation, so it must be able to
-                            // suppress a finding but never to create one:
-                            // crediting a spurious *test* call would push a
-                            // function with no real callers into the report.
-                            if !self.in_test() {
-                                let caller = self.fn_stack.last().cloned().unwrap_or_default();
-                                let n = id.to_string();
-                                self.scan.edges.entry(caller).or_default().insert(n.clone());
-                                self.scan.calls.entry(n).or_default().prod += 1;
-                            }
-                        }
+            let entry = calls.entry(e.to.name.clone()).or_default();
+            if e.in_test {
+                if e.kind.can_create_finding() {
+                    entry.test += 1;
+                    if entry.examples.len() < 3 {
+                        entry.examples.push(format!("{}:{}", e.file.display(), e.line));
                     }
-                    // Nested groups hold the macro's real body.
-                    self.record_tokens(g.stream());
-                    prev = None;
                 }
-                _ => prev = None,
+            } else {
+                entry.prod += 1;
             }
         }
-    }
 
-    fn record_call(&mut self, name: String, span: Span) {
-        let in_test = self.in_test();
-        let file = self.file.to_path_buf();
-        // Graph edge: whichever function we are currently inside calls `name`.
-        let caller = self.fn_stack.last().cloned().unwrap_or_default();
-        self.scan
-            .edges
-            .entry(caller)
-            .or_default()
-            .insert(name.clone());
-        let entry = self.scan.calls.entry(name).or_default();
-        if in_test {
-            entry.test += 1;
-            if entry.examples.len() < 3 {
-                entry
-                    .examples
-                    .push(format!("{}:{}", file.display(), line_of(span)));
-            }
-        } else {
-            entry.prod += 1;
+        Scan {
+            defs: ex.definitions,
+            calls,
+            edges,
+            crate_roots: ex.crate_roots,
+            reexported: ex.reexported,
+            precision,
+            ..Default::default()
         }
     }
 }
 
-impl<'ast, 'a> Visit<'ast> for FileVisitor<'a> {
-    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
-        let is_test = has_cfg_test(&node.attrs);
-        if is_test {
-            self.test_depth += 1;
-        }
-        syn::visit::visit_item_mod(self, node);
-        if is_test {
-            self.test_depth -= 1;
-        }
-    }
-
-    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
-        let is_trait = node.trait_.is_some();
-        if is_trait {
-            self.trait_depth += 1;
-        }
-        syn::visit::visit_item_impl(self, node);
-        if is_trait {
-            self.trait_depth -= 1;
-        }
-    }
-
-    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        // A #[test] fn is test code even outside a cfg(test) module.
-        let is_test_fn = node.attrs.iter().any(is_test_attr) || has_cfg_test(&node.attrs);
-        let is_pub = matches!(node.vis, syn::Visibility::Public(_));
-        let name = node.sig.ident.to_string();
-        self.record_def(name.clone(), node.sig.ident.span(), &node.attrs, is_pub);
-        self.fn_stack.push(name);
-        if is_test_fn {
-            self.test_depth += 1;
-            syn::visit::visit_item_fn(self, node);
-            self.test_depth -= 1;
-        } else {
-            syn::visit::visit_item_fn(self, node);
-        }
-        self.fn_stack.pop();
-    }
-
-    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        let is_pub = matches!(node.vis, syn::Visibility::Public(_));
-        let name = node.sig.ident.to_string();
-        self.record_def(name.clone(), node.sig.ident.span(), &node.attrs, is_pub);
-        self.fn_stack.push(name);
-        syn::visit::visit_impl_item_fn(self, node);
-        self.fn_stack.pop();
-    }
-
-    fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
-        // Record every name in a `pub use ...` as crate public API.
-        if matches!(node.vis, syn::Visibility::Public(_)) {
-            fn collect(tree: &syn::UseTree, out: &mut std::collections::HashSet<String>) {
-                match tree {
-                    syn::UseTree::Name(n) => {
-                        out.insert(n.ident.to_string());
-                    }
-                    syn::UseTree::Rename(r) => {
-                        out.insert(r.rename.to_string());
-                        out.insert(r.ident.to_string());
-                    }
-                    syn::UseTree::Path(p) => collect(&p.tree, out),
-                    syn::UseTree::Group(g) => g.items.iter().for_each(|t| collect(t, out)),
-                    syn::UseTree::Glob(_) => {}
-                }
-            }
-            collect(&node.tree, &mut self.scan.reexported);
-        }
-        syn::visit::visit_item_use(self, node);
-    }
-
-    fn visit_macro(&mut self, node: &'ast syn::Macro) {
-        // A macro body is an opaque token stream to syn, so calls written
-        // inside one are invisible to the expression visitors. Codebases that
-        // generate whole subsystems through macros (syscall tables, handler
-        // registries) would otherwise look as though nothing calls them.
-        //
-        // Scan the tokens for `ident (` and count it as a call. This
-        // over-approximates — a tuple-struct literal or a macro parameter can
-        // match — but over-counting *calls* only ever suppresses a finding,
-        // and a missed finding is far cheaper than a false accusation.
-        self.record_tokens(node.tokens.clone());
-        syn::visit::visit_macro(self, node);
-    }
-
-    fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
-        if let syn::Expr::Path(p) = &*node.func {
-            if let Some(seg) = p.path.segments.last() {
-                self.record_call(seg.ident.to_string(), seg.ident.span());
-            }
-        }
-        syn::visit::visit_expr_call(self, node);
-    }
-
-    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
-        self.record_call(node.method.to_string(), node.method.span());
-        syn::visit::visit_expr_method_call(self, node);
-    }
-}
-
-/// Directory segments that hold copies of code the crate does not own.
-const SKIP_DIRS: &[&str] = &[
-    "/target/",
-    "/node_modules/",
-    "/.git/",
-    "/worktrees/",
-    "/vendor/",
-    "/.cargo/",
-    "/build/",
-    "/dist/",
-    "/temp/",
-    "/examples/",
-];
-
-fn skipped(p: &Path) -> bool {
-    let s = format!("{}/", p.to_string_lossy());
-    SKIP_DIRS.iter().any(|d| s.contains(d))
-}
-
-/// Resolve what to actually scan.
-///
-/// A Rust crate is a directory with a `Cargo.toml`; its code lives in `src/`.
-/// A workspace holds several such crates. Scanning a whole repo tree sweeps in
-/// vendored copies and unrelated nested projects, so instead we locate every
-/// crate the repo owns and scan each one's `src/`.
-pub fn resolve_roots(path: &Path) -> Vec<PathBuf> {
-    // Cargo knows exactly which files it compiles, including targets declared
-    // in the manifest that live nowhere the convention would predict.
-    let ws = crate::targets::discover(path);
-    if ws.from_cargo {
-        let dirs = ws.production_source_dirs();
-        if !dirs.is_empty() {
-            return dirs;
-        }
-    }
-    let mut roots = Vec::new();
-    for entry in walkdir::WalkDir::new(path)
-        .max_depth(4)
-        .into_iter()
-        .filter_entry(|e| !skipped(e.path()))
-        .filter_map(Result::ok)
-    {
-        if entry.file_name() == "Cargo.toml" {
-            let src = entry.path().with_file_name("src");
-            if src.is_dir() {
-                roots.push(src);
-            }
-        }
-    }
-    if roots.is_empty() {
-        roots.push(path.to_path_buf());
-    }
-    roots
-}
-
-/// Walk a crate (or workspace), parse every `.rs` file, collect defs + calls.
+/// Analyse a crate with the default (syntactic) tier.
 pub fn scan_crate(root: &Path) -> anyhow::Result<Scan> {
-    let roots = resolve_roots(root);
-    let mut scan = Scan::default();
-    for croot in &roots {
-    for entry in walkdir::WalkDir::new(croot)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_file())
-    {
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("rs") {
-            continue;
-        }
-        if skipped(path) {
-            continue;
-        }
-        let s = path.to_string_lossy();
-        let src = match std::fs::read_to_string(path) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let ast = match syn::parse_file(&src) {
-            Ok(a) => a,
-            Err(_) => continue, // unparseable file: skip, don't fail the run
-        };
-        // Whole-file test code, by Rust convention: a `tests/` directory, or a
-        // file named `tests.rs` / `test.rs` / `*_test.rs` / `*_tests.rs`.
-        // Missing `src/**/tests.rs` treats every test helper in it as shipped
-        // production code, which is how you manufacture false positives.
-        let file_is_test = s.contains("/tests/")
-            || s.ends_with("/tests.rs")
-            || s.ends_with("/test.rs")
-            || s.ends_with("_test.rs")
-            || s.ends_with("_tests.rs");
-        let mut v = FileVisitor {
-            file: path,
-            scan: &mut scan,
-            test_depth: usize::from(file_is_test),
-            trait_depth: 0,
-            fn_stack: Vec::new(),
-            crate_root: croot.clone(),
-        };
-        v.visit_file(&ast);
-    }
-    }
-    scan.crate_roots = roots;
+    scan_crate_with(root, crate::frontend::Tier::Default)
+}
+
+/// Analyse a crate with a chosen tier.
+pub fn scan_crate_with(root: &Path, tier: crate::frontend::Tier) -> anyhow::Result<Scan> {
+    let ex = crate::frontend::extract(tier, root)?;
+    let mut scan = Scan::from_extract(ex, crate::frontend::precision(tier));
     scan.config = crate::config::Config::load(root).unwrap_or_default();
     scan.workspace = crate::targets::discover(root);
     Ok(scan)
+}
+
+/// Which directories the default frontend would read. Retained for `--explain`.
+pub fn resolve_roots(path: &Path) -> Vec<PathBuf> {
+    crate::frontend::syn_frontend::resolve_roots(path)
 }
 
 /// Names that are always reachable or conventionally unreferenced.
@@ -473,23 +158,23 @@ pub fn never_run(scan: &Scan) -> Vec<Finding> {
         if d.in_test || d.trait_impl || d.allowed_dead {
             continue;
         }
-        if ALWAYS_LIVE.contains(&d.name.as_str()) || scan.config.is_ignored(&d.name) {
+        if ALWAYS_LIVE.contains(&d.name()) || scan.config.is_ignored(d.name()) {
             continue;
         }
         // Re-exported from the crate root: it is public API, and its consumers
         // are outside this tree.
-        if scan.reexported.contains(&d.name) {
+        if scan.reexported.contains(d.name()) {
             continue;
         }
         // A name defined more than once is ambiguous under name-based matching;
         // skip it rather than risk a false positive.
-        if scan.defs.iter().filter(|o| o.name == d.name && !o.in_test).count() > 1 {
+        if scan.defs.iter().filter(|o| o.name() == d.name() && !o.in_test).count() > 1 {
             continue;
         }
-        if let Some(c) = scan.calls.get(&d.name) {
+        if let Some(c) = scan.calls.get(d.name()) {
             if c.prod == 0 && c.test > 0 {
                 out.push(Finding {
-                    name: d.name.clone(),
+                    name: d.name().to_string(),
                     file: d.file.display().to_string(),
                     line: d.line,
                     test_calls: c.test,
@@ -500,7 +185,7 @@ pub fn never_run(scan: &Scan) -> Vec<Finding> {
             }
         }
     }
-    out.sort_by(|a, b| b.test_calls.cmp(&a.test_calls));
+    out.sort_by(|a, b| b.test_calls.cmp(&a.test_calls).then(a.name.cmp(&b.name)));
     out
 }
 
@@ -551,16 +236,16 @@ pub fn production_roots(scan: &Scan) -> std::collections::HashSet<String> {
         // A root the developer declared in landed.toml outranks every
         // heuristic: they know how their program is entered, and the analyzer
         // cannot see through a task spawn or a handler registry.
-        let declared = scan.config.is_root(&d.name);
+        let declared = scan.config.is_root(d.name());
         let externally_reachable = if is_application {
             // Only a genuinely external surface counts: FFI symbols and
             // trait methods reached by dynamic dispatch.
             d.is_ffi || d.trait_impl
         } else {
-            d.is_ffi || d.trait_impl || d.is_pub || scan.reexported.contains(&d.name)
+            d.is_ffi || d.trait_impl || d.is_pub || scan.reexported.contains(d.name())
         };
         if declared || externally_reachable {
-            roots.insert(d.name.clone());
+            roots.insert(d.name().to_string());
         }
     }
     roots
@@ -579,7 +264,7 @@ pub fn test_roots(scan: &Scan) -> std::collections::HashSet<String> {
     scan.defs
         .iter()
         .filter(|d| d.is_test_fn || d.in_test)
-        .map(|d| d.name.clone())
+        .map(|d| d.name().to_string())
         .collect()
 }
 
@@ -617,9 +302,9 @@ pub fn never_run_graph(scan: &Scan) -> Vec<Finding> {
         if d.in_test || d.is_test_fn || d.trait_impl || d.allowed_dead || d.is_ffi {
             continue;
         }
-        if ALWAYS_LIVE.contains(&d.name.as_str())
-            || scan.reexported.contains(&d.name)
-            || scan.config.is_ignored(&d.name)
+        if ALWAYS_LIVE.contains(&d.name())
+            || scan.reexported.contains(d.name())
+            || scan.config.is_ignored(d.name())
         {
             continue;
         }
@@ -628,17 +313,17 @@ pub fn never_run_graph(scan: &Scan) -> Vec<Finding> {
         if scan
             .defs
             .iter()
-            .filter(|o| o.name == d.name && !o.in_test)
+            .filter(|o| o.name() == d.name() && !o.in_test)
             .count()
             > 1
         {
             continue;
         }
-        if !prod.contains(&d.name) && test.contains(&d.name) {
-            let c = scan.calls.get(&d.name);
+        if !prod.contains(d.name()) && test.contains(d.name()) {
+            let c = scan.calls.get(d.name());
             let prod_calls = c.map(|c| c.prod).unwrap_or(0);
             out.push(Finding {
-                name: d.name.clone(),
+                name: d.name().to_string(),
                 file: d.file.display().to_string(),
                 line: d.line,
                 test_calls: c.map(|c| c.test).unwrap_or(0),
@@ -648,7 +333,7 @@ pub fn never_run_graph(scan: &Scan) -> Vec<Finding> {
             });
         }
     }
-    out.sort_by(|a, b| b.test_calls.cmp(&a.test_calls));
+    out.sort_by(|a, b| b.test_calls.cmp(&a.test_calls).then(a.name.cmp(&b.name)));
     out
 }
 
@@ -660,10 +345,10 @@ pub fn to_dot(scan: &Scan) -> String {
         if d.in_test || d.is_test_fn {
             continue;
         }
-        let dead = !prod.contains(&d.name);
+        let dead = !prod.contains(d.name());
         s.push_str(&format!(
             "  \"{}\" [style=filled,fillcolor=\"{}\"];\n",
-            d.name,
+            d.name(),
             if dead { "#ffd6d6" } else { "#e8f0e8" }
         ));
     }
@@ -672,7 +357,7 @@ pub fn to_dot(scan: &Scan) -> String {
             continue;
         }
         for to in tos {
-            if scan.defs.iter().any(|d| &d.name == to && !d.in_test) {
+            if scan.defs.iter().any(|d| d.name() == to && !d.in_test) {
                 s.push_str(&format!("  \"{from}\" -> \"{to}\";\n"));
             }
         }
@@ -692,7 +377,7 @@ pub fn ambiguity_report(scan: &Scan) -> (usize, usize) {
     let mut counts: M<&str, usize> = M::new();
     for d in &scan.defs {
         if !d.in_test {
-            *counts.entry(d.name.as_str()).or_default() += 1;
+            *counts.entry(d.name()).or_default() += 1;
         }
     }
     let total = counts.values().sum();
@@ -776,12 +461,20 @@ pub fn dead_regions(scan: &Scan) -> Vec<Region> {
         // The frontier is the member with no caller inside the region. If
         // several qualify (or none, in a cycle), prefer the one the tests
         // reach most directly — that is the way in.
+        // max_by_key returns the last maximum it sees, and `component` is
+        // discovered through hash-ordered adjacency, so ties would resolve
+        // differently between runs. Break them on name: the output of a tool
+        // that gates CI has to be reproducible, or a baseline diff reports
+        // churn that is not in the code.
+        fn rank<'x>(by: &M<&str, &Finding>, n: &'x str) -> (usize, std::cmp::Reverse<&'x str>) {
+            (by[n].test_calls, std::cmp::Reverse(n))
+        }
         let entry_name = component
             .iter()
             .copied()
             .filter(|n| rev.get(n).map(|v| v.is_empty()).unwrap_or(true))
-            .max_by_key(|n| by_name[n].test_calls)
-            .or_else(|| component.iter().copied().max_by_key(|n| by_name[n].test_calls))
+            .max_by_key(|n| rank(&by_name, n))
+            .or_else(|| component.iter().copied().max_by_key(|n| rank(&by_name, n)))
             .unwrap_or(start);
 
         let entry = clone_finding(by_name[entry_name]);
@@ -813,7 +506,7 @@ pub fn dead_regions(scan: &Scan) -> Vec<Region> {
         });
     }
 
-    regions.sort_by(|a, b| b.size.cmp(&a.size));
+    regions.sort_by(|a, b| b.size.cmp(&a.size).then(a.entry.name.cmp(&b.entry.name)));
     regions
 }
 
@@ -854,7 +547,7 @@ pub fn evidence(scan: &Scan, name: &str) -> Evidence {
     let prod = reachable(scan, &roots);
     let test = reachable(scan, &test_roots(scan));
 
-    let defs: Vec<&FnDef> = scan.defs.iter().filter(|d| d.name == name).collect();
+    let defs: Vec<&FnDef> = scan.defs.iter().filter(|d| d.name() == name).collect();
     let d0 = defs.first();
 
     // Every function whose edge list contains this name.
@@ -879,7 +572,7 @@ pub fn evidence(scan: &Scan, name: &str) -> Evidence {
         _ => "not a root",
     };
 
-    let ambiguous = scan.defs.iter().filter(|o| o.name == name && !o.in_test).count() > 1;
+    let ambiguous = scan.defs.iter().filter(|o| o.name() == name && !o.in_test).count() > 1;
     let suppressed = match d0 {
         None => Some("no definition found in the scanned crates"),
         Some(d) if d.in_test => Some("defined in test code"),

@@ -161,3 +161,40 @@ fn a_clean_crate_produces_valid_sarif_with_no_results() {
     assert_eq!(v["version"], "2.1.0");
     assert_eq!(v["runs"][0]["results"].as_array().unwrap().len(), 0);
 }
+
+// ─── determinism ──────────────────────────────────────────────
+
+#[test]
+fn output_is_reproducible_across_runs() {
+    // Regions are discovered by walking hash-ordered adjacency, so ties in
+    // frontier selection and region size resolved differently between runs.
+    // A tool that gates CI and compares against a baseline must be
+    // reproducible, or a diff reports churn that is not in the code.
+    let path = here().join("fixtures/dead_region/src");
+    let run = || {
+        let out = Command::new(BIN)
+            .args(["check", path.to_str().unwrap(), "--graph", "--json"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    let first = run();
+    for i in 1..6 {
+        assert_eq!(first, run(), "run {i} differed from the first");
+    }
+}
+
+#[test]
+fn findings_have_a_total_order() {
+    // Sorting by one key leaves ties to input order, which is hash-derived.
+    // Every comparator must fall through to the name.
+    let s = landed::scan::scan_crate(&here().join("fixtures/dead_region/src")).unwrap();
+    let regions = landed::scan::dead_regions(&s);
+    let mut sorted = regions
+        .iter()
+        .map(|r| (std::cmp::Reverse(r.size), r.entry.name.clone()))
+        .collect::<Vec<_>>();
+    let original = sorted.clone();
+    sorted.sort();
+    assert_eq!(original, sorted, "regions must already be in total order");
+}

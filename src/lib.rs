@@ -14,6 +14,8 @@
 //! ```
 
 pub mod baseline;
+pub mod frontend;
+pub mod ir;
 pub mod config;
 pub mod report;
 pub mod scan;
