@@ -55,6 +55,12 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         fail_over: usize,
 
+        /// Resolve calls with the compiler instead of by name. Needs a
+        /// nightly toolchain and a crate that compiles; fails rather than
+        /// falling back, since the point of the mode is precision.
+        #[arg(long)]
+        precise: bool,
+
         /// Use whole-graph reachability instead of the per-function check:
         /// finds entire dead subsystems, not just their outermost function.
         #[arg(long)]
@@ -139,8 +145,14 @@ fn main() -> anyhow::Result<()> {
             flat,
             baseline: baseline_arg,
             format,
+            precise,
         } => {
-            let scan = scan::scan_crate(&path)?;
+            let tier = if precise {
+                landed::frontend::Tier::Precise
+            } else {
+                landed::frontend::Tier::Default
+            };
+            let scan = scan::scan_crate_with(&path, tier)?;
             let format = if json { "json".to_string() } else { format };
 
             if let Some(name) = explain {

@@ -137,12 +137,23 @@ pub struct Definition {
     /// The crate `src/` this came from. Entry points are a property of a
     /// crate, not of a workspace.
     pub crate_root: PathBuf,
+    /// Defining type, when the frontend saw one. Metadata rather than
+    /// identity: the default frontend knows the type at a *definition* but
+    /// not at a *call site*, so folding it into the id would stop the two
+    /// matching. A precise frontend, which knows both, promotes it into `id`.
+    pub self_ty: Option<String>,
 }
 
 impl Definition {
     /// Convenience: the bare name, whatever precision the id carries.
     pub fn name(&self) -> &str {
         &self.id.name
+    }
+
+    /// Graph key. Equals the bare name for a nominal id, so the default
+    /// frontend behaves exactly as it did before ids existed.
+    pub fn key(&self) -> String {
+        self.id.to_string()
     }
 }
 

@@ -5,8 +5,10 @@
 //! demands of the environment. The analysis layer consumes that and never
 //! learns which one ran.
 
+pub mod mir_frontend;
 pub mod syn_frontend;
 
+pub use mir_frontend::MirFrontend;
 pub use syn_frontend::SynFrontend;
 
 use crate::ir::{Extract, Frontend, Precision};
@@ -30,14 +32,7 @@ pub enum Tier {
 pub fn for_tier(tier: Tier) -> anyhow::Result<Box<dyn Frontend>> {
     match tier {
         Tier::Default => Ok(Box::new(SynFrontend)),
-        Tier::Precise => Err(anyhow::anyhow!(
-            "--precise is not implemented in this build.\n\
-             \n\
-             It requires a compiler-resolved frontend (MIR). Until that lands, \
-             run without --precise for the syntactic analysis, which reports \
-             what it cannot resolve rather than guessing — see `landed check \
-             --stats`."
-        )),
+        Tier::Precise => Ok(Box::new(MirFrontend)),
     }
 }
 
@@ -50,6 +45,10 @@ pub fn extract(tier: Tier, root: &Path) -> anyhow::Result<Extract> {
 pub fn precision(tier: Tier) -> Precision {
     match tier {
         Tier::Default => Precision::Nominal,
-        Tier::Precise => Precision::Resolved,
+        // Typed, not Resolved: the MIR dump names free functions without a
+        // module path, so two same-named functions in different modules stay
+        // indistinguishable. Methods are raised to Typed, which is where the
+        // ambiguity actually is.
+        Tier::Precise => Precision::Typed,
     }
 }

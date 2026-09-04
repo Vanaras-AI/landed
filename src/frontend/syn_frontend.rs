@@ -61,6 +61,7 @@ impl Frontend for SynFrontend {
                     test_depth: usize::from(file_is_test),
                     trait_depth: 0,
                     fn_stack: Vec::new(),
+                    impl_ty: None,
                     crate_root: croot.clone(),
                 };
                 v.visit_file(&ast);
@@ -138,6 +139,8 @@ struct FileVisitor<'a> {
     test_depth: usize,
     /// Depth of nested `impl Trait for Type` blocks.
     trait_depth: usize,
+    /// Self type of the innermost `impl` block, when it is a plain path.
+    impl_ty: Option<String>,
     /// Enclosing function names, innermost last. A call recorded while this is
     /// non-empty becomes a graph edge from its innermost entry.
     fn_stack: Vec<String>,
@@ -170,6 +173,7 @@ impl<'a> FileVisitor<'a> {
             is_pub,
             is_test_fn: attrs.iter().any(is_test_attr),
             is_ffi,
+            self_ty: self.impl_ty.clone(),
         });
     }
 
@@ -235,7 +239,15 @@ impl<'ast, 'a> Visit<'ast> for FileVisitor<'a> {
         if is_trait {
             self.trait_depth += 1;
         }
+        // Remember the self type so a definition can carry it as metadata.
+        // Only a plain path: a generic or reference receiver is not a name a
+        // call site could be matched against.
+        let prev = self.impl_ty.take();
+        if let syn::Type::Path(p) = &*node.self_ty {
+            self.impl_ty = p.path.segments.last().map(|s| s.ident.to_string());
+        }
         syn::visit::visit_item_impl(self, node);
+        self.impl_ty = prev;
         if is_trait {
             self.trait_depth -= 1;
         }

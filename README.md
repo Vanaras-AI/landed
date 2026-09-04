@@ -76,9 +76,33 @@ landed check --json              # versioned JSON envelope
 landed check --format github     # annotations that land on the PR diff
 landed check --format sarif      # SARIF 2.1.0 for code scanning
 landed check --graph --fail-over 0   # exit 1 on any finding, for CI
+landed check --graph --precise   # resolve calls with the compiler
 ```
 
 `--graph` is the interesting mode. `check` alone is the conservative one.
+
+## Precise mode
+
+The default keys the call graph on function names, so `A::process` and
+`B::process` are one node and the analysis declines to judge either. That
+silence covers 38–43% of a real codebase, reported by `--stats`.
+
+```bash
+landed check --graph --precise    # needs nightly and a crate that compiles
+```
+
+resolves calls through the compiler instead, which cuts ambiguity by roughly a
+third on real crates — 34.8% to 16.8% on one, 16.5% to 6.2% on another. It
+does not close the gap entirely: MIR names a method by its receiver type but a
+free function by bare identifier, so two same-named functions in different
+modules stay indistinguishable. What remains is still reported rather than
+hidden.
+
+It never falls back. Missing nightly, a crate that does not compile, or a path
+that is not a cargo project are each reported with what to do — a mode whose
+purpose is precision must not quietly answer with less.
+
+See [`docs/precise-mode.md`](docs/precise-mode.md).
 
 ## Adopting it on a codebase that already has findings
 
@@ -192,6 +216,8 @@ runs your tool again.
   answer is two tiers rather than a migration
 - [`docs/symbol-ir.md`](docs/symbol-ir.md) — the symbol IR that keeps the
   frontend out of the analysis layer
+- [`docs/precise-mode.md`](docs/precise-mode.md) — requirements, measured
+  ambiguity reduction, and why it reports Typed rather than Resolved
 - [`docs/semantic-reachability.md`](docs/semantic-reachability.md) — what it
   would take to find code that is called but can never act
 

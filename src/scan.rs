@@ -67,15 +67,18 @@ impl Scan {
 
         for e in &ex.edges {
             edges
-                .entry(e.from.name.clone())
+                .entry(e.from.to_string())
                 .or_default()
-                .insert(e.to.name.clone());
+                .insert(e.to.to_string());
 
-            let entry = calls.entry(e.to.name.clone()).or_default();
+            let entry = calls.entry(e.to.to_string()).or_default();
             if e.in_test {
                 if e.kind.can_create_finding() {
                     entry.test += 1;
-                    if entry.examples.len() < 3 {
+                    // A frontend that resolves calls precisely may not know
+                    // where they were written. An absent location is omitted
+                    // rather than printed as ":0".
+                    if entry.examples.len() < 3 && e.line > 0 {
                         entry.examples.push(format!("{}:{}", e.file.display(), e.line));
                     }
                 }
@@ -168,13 +171,13 @@ pub fn never_run(scan: &Scan) -> Vec<Finding> {
         }
         // A name defined more than once is ambiguous under name-based matching;
         // skip it rather than risk a false positive.
-        if scan.defs.iter().filter(|o| o.name() == d.name() && !o.in_test).count() > 1 {
+        if scan.defs.iter().filter(|o| o.key() == d.key() && !o.in_test).count() > 1 {
             continue;
         }
-        if let Some(c) = scan.calls.get(d.name()) {
+        if let Some(c) = scan.calls.get(&d.key()) {
             if c.prod == 0 && c.test > 0 {
                 out.push(Finding {
-                    name: d.name().to_string(),
+                    name: d.key(),
                     file: d.file.display().to_string(),
                     line: d.line,
                     test_calls: c.test,
@@ -245,7 +248,7 @@ pub fn production_roots(scan: &Scan) -> std::collections::HashSet<String> {
             d.is_ffi || d.trait_impl || d.is_pub || scan.reexported.contains(d.name())
         };
         if declared || externally_reachable {
-            roots.insert(d.name().to_string());
+            roots.insert(d.key());
         }
     }
     roots
@@ -264,7 +267,7 @@ pub fn test_roots(scan: &Scan) -> std::collections::HashSet<String> {
     scan.defs
         .iter()
         .filter(|d| d.is_test_fn || d.in_test)
-        .map(|d| d.name().to_string())
+        .map(|d| d.key())
         .collect()
 }
 
@@ -313,17 +316,17 @@ pub fn never_run_graph(scan: &Scan) -> Vec<Finding> {
         if scan
             .defs
             .iter()
-            .filter(|o| o.name() == d.name() && !o.in_test)
+            .filter(|o| o.key() == d.key() && !o.in_test)
             .count()
             > 1
         {
             continue;
         }
-        if !prod.contains(d.name()) && test.contains(d.name()) {
-            let c = scan.calls.get(d.name());
+        if !prod.contains(&d.key()) && test.contains(&d.key()) {
+            let c = scan.calls.get(&d.key());
             let prod_calls = c.map(|c| c.prod).unwrap_or(0);
             out.push(Finding {
-                name: d.name().to_string(),
+                name: d.key(),
                 file: d.file.display().to_string(),
                 line: d.line,
                 test_calls: c.map(|c| c.test).unwrap_or(0),
@@ -345,7 +348,7 @@ pub fn to_dot(scan: &Scan) -> String {
         if d.in_test || d.is_test_fn {
             continue;
         }
-        let dead = !prod.contains(d.name());
+        let dead = !prod.contains(&d.key());
         s.push_str(&format!(
             "  \"{}\" [style=filled,fillcolor=\"{}\"];\n",
             d.name(),
@@ -374,10 +377,10 @@ pub fn to_dot(scan: &Scan) -> String {
 /// its size should be known rather than assumed.
 pub fn ambiguity_report(scan: &Scan) -> (usize, usize) {
     use std::collections::HashMap as M;
-    let mut counts: M<&str, usize> = M::new();
+    let mut counts: M<String, usize> = M::new();
     for d in &scan.defs {
         if !d.in_test {
-            *counts.entry(d.name()).or_default() += 1;
+            *counts.entry(d.key()).or_default() += 1;
         }
     }
     let total = counts.values().sum();
