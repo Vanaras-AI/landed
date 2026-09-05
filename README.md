@@ -231,6 +231,64 @@ runs your tool again.
 - [`docs/semantic-reachability.md`](docs/semantic-reachability.md) — what it
   would take to find code that is called but can never act
 
+## Measured on real codebases
+
+Thirteen public repositories that describe themselves as written by AI, in
+four languages. Every one was analysed with the default tier — no config, no
+baseline, nothing declared.
+
+| language | kind | functions | unreachable | confident regions |
+|---|---|---:|---:|---:|
+| rust | application | 11530 | 414 | 241 |
+| rust | application | 2999 | 54 | 34 |
+| rust | application | 848 | 20 | 7 |
+| typescript | application | 840 | 0 | — |
+| python | application | 632 | 49 | 8 |
+| go | application | 546 | 27 | 5 |
+| rust | 2 applications, 1 library | 346 | 0 | — |
+| typescript | application | 260 | 31 | 3 |
+| typescript | application | 172 | 0 | — |
+| go | application | 97 | 0 | — |
+| rust | application | 27 | 14 | 5 |
+
+Repositories are not named; the last row groups three small ones. Seven of the
+thirteen carry findings, and six are clean — which is the answer a tool that
+accuses has to be willing to give. The 27-function project is the outlier at
+half its code unreachable, and small enough to read end to end.
+
+Findings count functions; confidence is counted per region, which is the unit
+of work — a dead subsystem is one thing to delete, not forty.
+
+**Every confident finding on the TypeScript extension was checked by hand and
+all three were real**: two are exported, called six times each from the test
+suite, and mentioned nowhere else in `src/` at all; the third's only
+appearance outside its own definition is the word in a comment.
+
+The uncertain ones behaved as they are meant to. One function *is* called from
+production — through a callback invoked dynamically, which name-based edges
+cannot follow — and the tool said "either a dead subsystem or a root the
+analyzer failed to resolve" instead of accusing it.
+
+### What the run found in the tool itself
+
+The first pass reported most of the non-Rust projects clean. That was this
+tool being wrong, not the code being good. Five defects, none of which the
+test fixtures could have caught, because each fixture was written in the
+subset the walker already read:
+
+| symptom | cause |
+|---|---|
+| 5 functions read in a 61-file project | `const f = () => {}` carries no name of its own; only named declarations were read |
+| every component looked unreferenced | `<Chart />` is not a call expression, and `.tsx` needs a different grammar from `.ts` — not a flag |
+| **every TypeScript and Go project reported clean** | publicness was one convention borrowed across all four languages, so nearly every function was a root and every result vacuous |
+| 107 live functions condemned at once | an extension is entered by its host at a name nothing in the repository calls, so everything behind it died with it |
+| an uncertain finding printed as certain | the flat report printed "0 production calls" as a constant |
+
+The fourth is the one worth dwelling on: a single unresolved root turned 88
+live functions into findings. That is the failure mode this tool is built to
+avoid, and it took a codebase written against no fixture of ours to surface
+it. [`docs/languages.md`](docs/languages.md) has the detail.
+
 ## Limits
 
 - **Four languages, one of them further along.** Rust, Python, TypeScript and
