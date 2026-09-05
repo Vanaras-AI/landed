@@ -30,8 +30,16 @@ pub struct Scan {
     pub edges: HashMap<String, HashSet<String>>,
     /// Every crate `src/` dir that was read.
     pub crate_roots: Vec<PathBuf>,
-    /// Crate layout as cargo reports it.
+    /// Crate layout as cargo reports it. Empty for non-Rust projects.
     pub workspace: Workspace,
+    /// What the project says about itself, in whatever language it is written:
+    /// whether anything here runs on its own, and what its entry points are.
+    /// The analysis asks the project once, and never asks a build tool.
+    pub is_application: bool,
+    pub project_entry_points: Vec<String>,
+    /// How those answers were reached, for `--explain` and for anyone who
+    /// thinks the analysis picked wrong.
+    pub project_description: String,
     /// Developer-declared roots and ignores.
     pub config: crate::config::Config,
     /// Names re-exported at a crate root.
@@ -58,6 +66,9 @@ impl Default for Scan {
             reexported: HashSet::new(),
             precision: Precision::Nominal,
             nominal_findings: None,
+            is_application: false,
+            project_entry_points: Vec::new(),
+            project_description: String::new(),
         }
     }
 }
@@ -143,10 +154,27 @@ pub fn scan_crate(root: &Path) -> anyhow::Result<Scan> {
 
 /// Analyse a crate with a chosen tier.
 pub fn scan_crate_with(root: &Path, tier: crate::frontend::Tier) -> anyhow::Result<Scan> {
-    let ex = crate::frontend::extract(tier, root)?;
+    scan_crate_as(root, tier, None)
+}
+
+/// Analyse a crate with a chosen tier, and a language stated rather than
+/// detected. Detection reads manifests first and file counts second, which is
+/// right for a project and wrong for a polyglot repository.
+pub fn scan_crate_as(
+    root: &Path,
+    tier: crate::frontend::Tier,
+    lang: Option<crate::lang::Language>,
+) -> anyhow::Result<Scan> {
+    let ex = crate::frontend::extract_as(tier, root, lang)?;
     let mut scan = Scan::from_extract(ex, crate::frontend::precision(tier));
     scan.config = crate::config::Config::load(root).unwrap_or_default();
     scan.workspace = crate::targets::discover(root);
+
+    // The project answers for itself, in whatever language it is written.
+    let project = crate::project::detect_as(root, lang);
+    scan.is_application = project.is_application();
+    scan.project_entry_points = project.entry_points();
+    scan.project_description = project.describe();
 
     if tier != crate::frontend::Tier::Default {
         if let Ok(base) = scan_crate(root) {
@@ -253,27 +281,25 @@ pub fn production_roots(scan: &Scan) -> std::collections::HashSet<String> {
     roots.insert(String::new());
     roots.insert("main".into());
 
-    // Classify each crate: does it have a binary entry point of its own?
-    let is_bin_crate = |croot: &Path| -> bool {
-        croot.join("main.rs").is_file() || croot.join("bin").is_dir()
-    };
-
-    // Workspace-level question: is this thing an application or a library?
+    // Is this an application or a library?
     //
-    // An application has at least one binary. Its library crates are internal
-    // plumbing — reached through that binary, not by outside consumers — so
-    // their `pub` surface is NOT an entry point, and code nothing runs is
-    // genuinely dead.
+    // An application has something that runs on its own. Its internal library
+    // surface is not an entry point — it is reached through that binary — so
+    // code nothing runs is genuinely dead.
     //
-    // A crate with no binary anywhere is a library. Its consumers are other
-    // people's crates, which we cannot see, so its whole public API must be
-    // treated as reachable or we would accuse the entire codebase. (Observed
+    // A project with nothing runnable is a library. Its consumers are other
+    // people's code, which we cannot see, so its whole public API must be
+    // treated as reachable or the entire codebase would be accused. (Observed
     // before this rule: a 120-fn library reported 51% dead, all false.)
-    let is_application = if scan.workspace.from_cargo {
-        scan.workspace.is_application()
-    } else {
-        scan.crate_roots.iter().any(|r| is_bin_crate(r))
-    };
+    //
+    // Every language answers differently, and none of them is asked here —
+    // the project was asked, once, when the scan was built.
+    let is_application = scan.is_application;
+
+    // Entry points the language declares regardless of who calls them.
+    for name in &scan.project_entry_points {
+        roots.insert(name.clone());
+    }
 
     for d in &scan.defs {
         if d.in_test || d.is_test_fn {
@@ -307,11 +333,15 @@ pub fn is_application(scan: &Scan) -> bool {
 /// Roots of the test-reachable set: every `#[test]`-style function, plus
 /// every function defined inside a `#[cfg(test)]` module.
 pub fn test_roots(scan: &Scan) -> std::collections::HashSet<String> {
-    scan.defs
-        .iter()
-        .filter(|d| d.is_test_fn || d.in_test)
-        .map(|d| d.key())
-        .collect()
+    let mut roots: std::collections::HashSet<String> =
+        std::iter::once(crate::ir::TEST_MODULE_ROOT.to_string()).collect();
+    roots.extend(
+        scan.defs
+            .iter()
+            .filter(|d| d.is_test_fn || d.in_test)
+            .map(|d| d.key()),
+    );
+    roots
 }
 
 /// Everything reachable from `roots` by following call edges transitively.

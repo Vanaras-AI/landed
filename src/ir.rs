@@ -209,6 +209,15 @@ pub struct Extract {
     pub crate_roots: Vec<PathBuf>,
 }
 
+/// Caller used for a call written at module level inside test code.
+///
+/// The empty-named symbol means "module level", and in production that is an
+/// entry point — a static initialiser runs. Test files also execute at module
+/// level, and crediting those calls to the same root would make anything a
+/// test file mentions look production-reachable. Languages whose test files
+/// are ordinary modules — Python, TypeScript — hit this immediately.
+pub const TEST_MODULE_ROOT: &str = "<test module>";
+
 /// A source of definitions and edges.
 ///
 /// Implementations differ in precision and in what they require of the

@@ -17,6 +17,8 @@ pub mod baseline;
 pub mod frontend;
 pub mod ir;
 pub mod config;
+pub mod lang;
+pub mod project;
 pub mod report;
 pub mod scan;
 pub mod targets;

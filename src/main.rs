@@ -94,6 +94,13 @@ enum Cmd {
         /// Use this to check a finding, or to see why one was not reported.
         #[arg(long, value_name = "FN")]
         explain: Option<String>,
+
+        /// Analyse the tree as this language instead of the detected one.
+        /// Detection reads manifests first and file counts second, which is
+        /// right for a project but wrong for a polyglot repository where the
+        /// part you care about is not the part with the most files.
+        #[arg(long, value_name = "LANG")]
+        lang: Option<landed::lang::Language>,
     },
 }
 
@@ -146,13 +153,14 @@ fn main() -> anyhow::Result<()> {
             baseline: baseline_arg,
             format,
             precise,
+            lang,
         } => {
             let tier = if precise {
                 landed::frontend::Tier::Precise
             } else {
                 landed::frontend::Tier::Default
             };
-            let scan = scan::scan_crate_with(&path, tier)?;
+            let scan = scan::scan_crate_as(&path, tier, lang)?;
             let format = if json { "json".to_string() } else { format };
 
             if let Some(name) = explain {
@@ -339,6 +347,11 @@ fn report(scan: &scan::Scan, findings: &[scan::Finding]) {
     println!("landed v{}", env!("CARGO_PKG_VERSION"));
     println!("  {prod_defs} production functions scanned\n");
 
+    if scan.defs.is_empty() {
+        nothing_read(scan);
+        return;
+    }
+
     if findings.is_empty() {
         println!("  No never-run functions found.");
         return;
@@ -386,6 +399,19 @@ fn precision_caveat(scan: &scan::Scan, found: usize) {
     println!();
 }
 
+/// A scan that read nothing has nothing to say, and must not say it in the
+/// words of a clean bill of health. The likeliest causes are a wrong language
+/// and a path with no source under it, so it names what it looked for.
+fn nothing_read(scan: &scan::Scan) {
+    println!("  No source was read.");
+    println!();
+    println!("  The project was read as: {}", scan.project_description);
+    println!();
+    println!("  This is not a clean result — nothing was analysed. Either the");
+    println!("  path holds no source of that language, or detection picked the");
+    println!("  wrong one. State it with --lang <rust|python|typescript|go>.");
+}
+
 fn header(scan: &scan::Scan) {
     let prod = scan.defs.iter().filter(|d| !d.in_test).count();
     let (ambiguous, total) = scan::ambiguity_report(scan);
@@ -423,6 +449,11 @@ fn report_regions(
 ) {
     header(scan);
     precision_caveat(scan, total);
+
+    if scan.defs.is_empty() {
+        nothing_read(scan);
+        return;
+    }
 
     if regions.is_empty() {
         println!("  Everything is reachable from production entry points.");

@@ -6,10 +6,14 @@
 landed check --graph .
 ```
 
-`landed` reads a Rust crate, builds its call graph, and reports functions the
+`landed` reads a project, builds its call graph, and reports functions the
 tests can reach but the running program cannot. Not unused imports — whole
 features that were written, tested, reviewed, merged, and never connected to
 anything.
+
+Reachability is a property of a call graph, not of a syntax, so the same
+analysis runs on **Rust, Python, TypeScript and Go**. The language is detected
+from the project's own manifests and layout; `--lang` states it instead.
 
 ## The failure it looks for
 
@@ -229,15 +233,21 @@ runs your tool again.
 
 ## Limits
 
-- **Rust only.**
+- **Four languages, one of them further along.** Rust, Python, TypeScript and
+  Go are read; only Rust has a `--precise` tier, because it is the only one
+  here whose compiler output this tool reads. The Rust frontend has been run
+  against real codebases; the others are new, and have been validated against
+  fixtures rather than against a corpus.
 - **Edges are matched by name**, not resolved by type. A method reached only
   through a generic bound may be reported. Every finding names a file and line,
   and `--explain` shows the whole picture for one symbol.
-- **Entry points are a model, not a fact.** Crate layout comes from `cargo
-  metadata` where cargo can answer — targets, kinds and source paths, so
-  tests, benches and examples are excluded by cargo's own classification
-  rather than by matching path names. Where cargo cannot answer the tool falls
-  back to directory shape. An application (any `[[bin]]`) treats its library
+- **Entry points are a model, not a fact.** Each language answers for itself:
+  a Rust crate through `cargo metadata`, a Go module through `package main`, a
+  Python package through a console script or a `__main__`, a Node package
+  through `"bin"`. Rust layout comes from `cargo metadata` where cargo can
+  answer — targets, kinds and source paths, so tests, benches and examples are
+  excluded by cargo's own classification rather than by matching path names.
+  Where cargo cannot answer the tool falls back to directory shape. An application (any `[[bin]]`) treats its library
   crates as internal; a crate with no binary is a library whose whole public
   API is an entry point. Get this wrong and the tool accuses everything or
   nothing — both happened during development. `landed.toml` exists for the
