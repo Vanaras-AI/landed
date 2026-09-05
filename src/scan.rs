@@ -37,6 +37,8 @@ pub struct Scan {
     /// The analysis asks the project once, and never asks a build tool.
     pub is_application: bool,
     pub project_entry_points: Vec<String>,
+    /// Files a host loads. Whatever they export is called from outside.
+    pub entry_files: Vec<PathBuf>,
     /// How those answers were reached, for `--explain` and for anyone who
     /// thinks the analysis picked wrong.
     pub project_description: String,
@@ -68,6 +70,7 @@ impl Default for Scan {
             nominal_findings: None,
             is_application: false,
             project_entry_points: Vec::new(),
+            entry_files: Vec::new(),
             project_description: String::new(),
         }
     }
@@ -174,6 +177,7 @@ pub fn scan_crate_as(
     let project = crate::project::detect_as(root, lang);
     scan.is_application = project.is_application();
     scan.project_entry_points = project.entry_points();
+    scan.entry_files = project.entry_files();
     scan.project_description = project.describe();
 
     if tier != crate::frontend::Tier::Default {
@@ -299,6 +303,17 @@ pub fn production_roots(scan: &Scan) -> std::collections::HashSet<String> {
     // Entry points the language declares regardless of who calls them.
     for name in &scan.project_entry_points {
         roots.insert(name.clone());
+    }
+
+    // What a host loads, it also calls. An entry module's exports are entered
+    // from outside the repository, so nothing here will ever be seen calling
+    // them.
+    if !scan.entry_files.is_empty() {
+        for d in &scan.defs {
+            if d.is_pub && !d.in_test && scan.entry_files.iter().any(|f| *f == d.file) {
+                roots.insert(d.key());
+            }
+        }
     }
 
     for d in &scan.defs {
@@ -643,6 +658,11 @@ pub fn evidence(scan: &Scan, name: &str) -> Evidence {
         Some(d) if d.is_ffi => "#[no_mangle] / extern",
         Some(d) if d.trait_impl => "trait impl method (dynamic dispatch)",
         Some(_) if scan.reexported.contains(name) => "re-exported at crate root",
+        Some(d)
+            if d.is_pub && scan.entry_files.iter().any(|f| *f == d.file) =>
+        {
+            "exported from the entry module a host loads"
+        }
         Some(d) if d.is_pub && !is_application(scan) => "public API of a library crate",
         _ if name == "main" => "program entry point",
         _ => "not a root",

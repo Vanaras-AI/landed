@@ -55,6 +55,20 @@ pub trait Project {
     /// conventional entry points.
     fn entry_points(&self) -> Vec<String>;
 
+    /// Files a host loads and calls into, rather than files this project's own
+    /// code calls. Whatever they export is invoked from outside and is a root.
+    ///
+    /// A Rust binary needs none of this: its entry is a function called
+    /// `main`, and a name is enough. An editor extension, a serverless
+    /// handler and a plugin are all entered by something that is not in the
+    /// repository, at a name only the entry module knows. Without this, the
+    /// entry function looks uncalled and everything behind it is condemned —
+    /// one broken root turned 107 live functions into findings before this
+    /// existed.
+    fn entry_files(&self) -> Vec<PathBuf> {
+        Vec::new()
+    }
+
     /// Human-readable account of how those answers were reached, for
     /// `--explain` and for anyone who thinks the analysis picked wrong.
     fn describe(&self) -> String;
@@ -250,11 +264,74 @@ impl Project for ConventionProject {
                                 .unwrap_or(false)
                     })
             }
-            Language::TypeScript => std::fs::read_to_string(self.root.join("package.json"))
-                .map(|s| s.contains("\"bin\""))
-                .unwrap_or(false),
+            // `"bin"` is the only signal npm defines, and it covers CLIs
+            // alone. The two commonest kinds of TypeScript application
+            // declare themselves otherwise: a bundled web app is marked
+            // `"private": true`, because npm refuses to publish it and it was
+            // never meant for anyone to import, and it has an `index.html`
+            // for the bundler to use as its entry; an editor or runtime
+            // extension names its host in `"engines"` and is loaded by it.
+            //
+            // Getting this wrong is not a small error. A library's whole
+            // public surface is a root, so calling an application a library
+            // makes every exported function reachable and the analysis says
+            // nothing at all — which is what it said about every TypeScript
+            // project until this was fixed.
+            Language::TypeScript => {
+                let manifest =
+                    std::fs::read_to_string(self.root.join("package.json")).unwrap_or_default();
+                let has = |k: &str| manifest.contains(k);
+                has("\"bin\"")
+                    || has("\"private\": true")
+                    || has("\"private\":true")
+                    || has("\"engines\"")
+                    || self.root.join("index.html").is_file()
+            }
             Language::Rust => self.root.join("src/main.rs").is_file(),
         }
+    }
+
+    fn entry_files(&self) -> Vec<PathBuf> {
+        if self.lang != Language::TypeScript || !self.is_application() {
+            return Vec::new();
+        }
+        let manifest = match std::fs::read_to_string(self.root.join("package.json")) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let json: serde_json::Value = match serde_json::from_str(&manifest) {
+            Ok(v) => v,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut out = Vec::new();
+        for key in ["main", "module"] {
+            let Some(decl) = json.get(key).and_then(|v| v.as_str()) else { continue };
+            // The manifest names the *built* file. Sources are what is
+            // analysed, so the declaration is mapped back: the build
+            // directory becomes a source directory, and the extension becomes
+            // one TypeScript writes.
+            let rel = decl.trim_start_matches("./");
+            let stem = rel.rsplit_once('.').map(|(a, _)| a).unwrap_or(rel);
+            let tail = stem.split_once('/').map(|(head, rest)| {
+                if matches!(head, "out" | "dist" | "build" | "lib") { rest } else { stem }
+            });
+            for candidate in [tail.unwrap_or(stem), stem] {
+                for dir in ["src", ""] {
+                    for ext in ["ts", "tsx"] {
+                        let p = if dir.is_empty() {
+                            self.root.join(format!("{candidate}.{ext}"))
+                        } else {
+                            self.root.join(dir).join(format!("{candidate}.{ext}"))
+                        };
+                        if p.is_file() && !out.contains(&p) {
+                            out.push(p);
+                        }
+                    }
+                }
+            }
+        }
+        out
     }
 
     fn entry_points(&self) -> Vec<String> {

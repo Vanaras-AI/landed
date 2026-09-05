@@ -330,7 +330,7 @@ fn main() -> anyhow::Result<()> {
                     "{}",
                     serde_json::to_string_pretty(&report::sarif(&findings, None, &path))?
                 ),
-                _ => report(&scan, &findings),
+                _ => report(&scan, &findings, &path),
             }
 
             if fail_over > 0 && findings.len() > fail_over {
@@ -341,7 +341,7 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn report(scan: &scan::Scan, findings: &[scan::Finding]) {
+fn report(scan: &scan::Scan, findings: &[scan::Finding], root: &std::path::Path) {
     let prod_defs = scan.defs.iter().filter(|d| !d.in_test).count();
 
     println!("landed v{}", env!("CARGO_PKG_VERSION"));
@@ -362,15 +362,24 @@ fn report(scan: &scan::Scan, findings: &[scan::Finding]) {
     println!("{}", "─".repeat(78));
 
     for f in findings {
-        let loc = format!("{}:{}", f.file, f.line);
         println!("\n  {}", f.name);
-        println!("    defined  {loc}");
-        println!(
-            "    callers  {} test call(s), 0 production calls",
-            f.test_calls
-        );
+        println!("    defined  {}:{}", rel(&f.file, root), f.line);
+        // This said "0 production calls" outright, which is true of the
+        // direct check and false of `--graph --flat`, where a finding may
+        // have production callers that are themselves unreachable. Printing
+        // it as a certainty made an uncertain finding read as a confident
+        // one — the one kind of error this report must not make.
+        if f.prod_calls == 0 {
+            println!("    callers  {} test call(s), no production caller", f.test_calls);
+        } else {
+            println!(
+                "    callers  {} test call(s), {} production call(s) — but every",
+                f.test_calls, f.prod_calls
+            );
+            println!("             caller is itself unreachable, so this is uncertain");
+        }
         for e in f.examples.iter().take(2) {
-            println!("             {e}");
+            println!("             {}", rel(e, root));
         }
     }
 
@@ -417,6 +426,13 @@ fn header(scan: &scan::Scan) {
     let (ambiguous, total) = scan::ambiguity_report(scan);
     println!("landed v{}", env!("CARGO_PKG_VERSION"));
     println!("  {prod} production functions scanned");
+    // The single most consequential decision the tool makes, and it used to
+    // be invisible: a library's whole public surface is a root, so calling an
+    // application a library reports nothing, and the reverse reports
+    // everything. Anyone doubting a result should see this first.
+    if !scan.project_description.is_empty() {
+        println!("  read as {}", scan.project_description);
+    }
     if ambiguous > 0 {
         println!(
             "  {ambiguous} ({:.1}%) share a name with another function and are not analysed",

@@ -29,7 +29,9 @@ anything here runs on its own, and where it starts.
 | identified by | `Cargo.toml` | `pyproject.toml`, `setup.py` | `tsconfig.json`, `package.json` | `go.mod` |
 | layout from | `cargo metadata` | convention | convention | convention |
 | test files | `tests/`, `*_test.rs`, `#[cfg(test)]` | `test_*.py`, `*_test.py`, `tests/` | `*.test.ts`, `*.spec.ts`, `__tests__/` | `*_test.go` |
-| runs on its own if | a `[[bin]]` target | a console script or a `__main__` | `"bin"` in package.json | `package main` |
+| runs on its own if | a `[[bin]]` target | a console script or a `__main__` | `"bin"`, `"private": true`, `"engines"`, or an `index.html` | `package main` |
+| public means | `pub` | no leading `_` | `export` | a capital first letter |
+| host entry | — | — | exports of the `main`/`module` file | — |
 
 That table is the whole of what a language costs. `CargoProject` asks cargo,
 because cargo knows exactly which files it compiles and can name targets that
@@ -66,6 +68,33 @@ Grammars are pinned against a tree-sitter runtime of `0.25`; the grammar crates
 require ABI 15, and an older runtime fails to load them at all rather than
 mis-parsing.
 
+## Publicness decides everything
+
+A library's whole public surface is its root set, so what counts as public
+decides whether the analysis says anything at all. One convention — "no
+leading underscore" — was borrowed across all four languages at first. In
+TypeScript and Go that makes almost every function public, every function a
+root, and every result vacuous. Each language now states it exactly, and the
+table above is that statement.
+
+The application/library call matters for the same reason, in the other
+direction: call an application a library and it reports nothing; call a
+library an application and it reports its entire API. The report prints which
+it chose, on the line under the function count, because it is the single
+assumption most worth checking.
+
+## Entry modules
+
+A Rust binary starts at a function called `main`, and a name is enough. An
+editor extension, a serverless handler and a plugin are entered by something
+outside the repository, at a name only the entry module knows — `activate`,
+for a VS Code extension. Nothing in the repository calls it, so it looks
+unreachable, and everything behind it is condemned with it.
+
+`Project::entry_files` names the modules a host loads; their exports are
+roots. On a real extension this was the difference between 119 findings and
+31, and the 88 that disappeared were all live.
+
 ## What is not modelled
 
 - **Dynamic dispatch.** A method reached only through an interface, a duck-typed
@@ -82,6 +111,19 @@ mis-parsing.
 
 Each of these fails in the direction the tool is built to fail in: **an
 over-approximation may suppress a finding, never create one.**
+
+## What running it on real code found
+
+Every one of these was a defect the fixtures did not catch, found by pointing
+the tool at codebases it had not been written against:
+
+| symptom | cause |
+|---|---|
+| 5 functions read in a 61-file project | `const f = () => {}` carries no name of its own, and only named declarations were read |
+| every component looked unreferenced | `<Chart />` is not a call expression, and `.tsx` needs a different grammar from `.ts` |
+| every TypeScript and Go project reported clean | publicness was one borrowed convention, so every function was a root |
+| 107 live functions condemned at once | the host entry module's exports were treated as ordinary code |
+| an uncertain finding printed as certain | the flat report said "0 production calls" as a constant |
 
 ## Test-file module level
 

@@ -47,9 +47,24 @@ fn spec(lang: Language) -> Spec {
                 "function_expression",
                 "generator_function_declaration",
                 "method_definition",
+                // `const f = () => {}` is the dominant idiom in modern
+                // TypeScript, and carries no name of its own — the name is on
+                // the binding above it. Without these two kinds the walker
+                // reads a handful of functions in a codebase of hundreds and
+                // reports the rest of it clean.
+                "arrow_function",
+                "generator_function",
             ],
             types: &["class_declaration", "class"],
-            calls: &["call_expression", "new_expression"],
+            // `<Chart />` is how a React component is used. It is not a
+            // call_expression, and without these kinds every component in a
+            // codebase looks as though nothing refers to it.
+            calls: &[
+                "call_expression",
+                "new_expression",
+                "jsx_self_closing_element",
+                "jsx_opening_element",
+            ],
             callee_field: "function",
         },
         Language::Go => Spec {
@@ -68,10 +83,24 @@ fn spec(lang: Language) -> Spec {
     }
 }
 
-fn grammar(lang: Language) -> Option<tree_sitter::Language> {
+/// The grammar for a language, and for TypeScript the dialect matching the
+/// file. TSX is a separate grammar, not a superset flag: parsing a `.tsx` file
+/// with the plain TypeScript grammar yields errors where the JSX begins, and
+/// every component below that point is silently unread.
+fn grammar(lang: Language, file: &Path) -> Option<tree_sitter::Language> {
     match lang {
         Language::Python => Some(tree_sitter_python::LANGUAGE.into()),
-        Language::TypeScript => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+        Language::TypeScript => {
+            let jsx = matches!(
+                file.extension().and_then(|e| e.to_str()),
+                Some("tsx") | Some("jsx")
+            );
+            Some(if jsx {
+                tree_sitter_typescript::LANGUAGE_TSX.into()
+            } else {
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
+            })
+        }
         Language::Go => Some(tree_sitter_go::LANGUAGE.into()),
         Language::Rust => None,
     }
@@ -89,14 +118,10 @@ impl Frontend for TreeSitterFrontend {
     fn extract(&self, root: &Path) -> anyhow::Result<Extract> {
         let lang = self.language;
         let project = crate::project::detect_as(root, Some(lang));
-        let grammar = grammar(lang)
-            .ok_or_else(|| anyhow::anyhow!("no tree-sitter grammar for {}", lang.name()))?;
         let spec = spec(lang);
 
         let mut parser = Parser::new();
-        parser
-            .set_language(&grammar)
-            .map_err(|e| anyhow::anyhow!("could not load the {} grammar: {e}", lang.name()))?;
+        let mut loaded: Option<tree_sitter::Language> = None;
 
         let mut out = Extract::default();
         for path in project.source_files() {
@@ -104,6 +129,14 @@ impl Frontend for TreeSitterFrontend {
                 Ok(s) => s,
                 Err(_) => continue,
             };
+            let want = grammar(lang, &path)
+                .ok_or_else(|| anyhow::anyhow!("no tree-sitter grammar for {}", lang.name()))?;
+            if loaded.as_ref() != Some(&want) {
+                parser.set_language(&want).map_err(|e| {
+                    anyhow::anyhow!("could not load the {} grammar: {e}", lang.name())
+                })?;
+                loaded = Some(want);
+            }
             let tree = match parser.parse(&src, None) {
                 Some(t) => t,
                 // Unparseable file: skip it, do not fail the run. The same
@@ -111,6 +144,7 @@ impl Frontend for TreeSitterFrontend {
                 None => continue,
             };
             let mut w = Walker {
+                lang,
                 out: &mut out,
                 src: src.as_bytes(),
                 spec: &spec,
@@ -147,6 +181,7 @@ fn module_path(file: &Path, root: &Path, lang: Language) -> Option<String> {
 }
 
 struct Walker<'a> {
+    lang: Language,
     out: &'a mut Extract,
     src: &'a [u8],
     spec: &'a Spec,
@@ -162,8 +197,37 @@ impl<'a> Walker<'a> {
         n.utf8_text(self.src).ok().map(str::to_string)
     }
 
+    /// The name a callable is known by.
+    ///
+    /// Most declarations carry their own. A function *value* does not: in
+    /// `const handle = () => {}` the name belongs to the binding above, and
+    /// the same holds for a class field, an object-literal property, a Python
+    /// assignment and a Go `var`. Callers write that name, so that is the
+    /// name the graph must key on.
+    ///
+    /// A function value with no binding above it — a callback argument, an
+    /// IIFE — has no name and gets no definition. Its body still belongs to
+    /// the function that wrote it, which is what happens when this returns
+    /// `None`.
     fn named(&self, n: Node) -> Option<String> {
-        self.text(n.child_by_field_name("name")?)
+        if let Some(own) = n.child_by_field_name("name") {
+            return self.text(own);
+        }
+        let parent = n.parent()?;
+        let field = match parent.kind() {
+            "variable_declarator" | "public_field_definition" | "field_definition" => "name",
+            "pair" => "key",
+            // Python `f = lambda: ...`, Go `f := func() {}`.
+            "assignment" | "short_var_declaration" => "left",
+            "var_spec" | "const_spec" => "name",
+            _ => return None,
+        };
+        let name = parent.child_by_field_name(field)?;
+        // Only a plain identifier is a name. Destructuring, a computed key
+        // and a member assignment are not, and are not guessed at.
+        matches!(name.kind(), "identifier" | "property_identifier" | "type_identifier")
+            .then(|| self.text(name))
+            .flatten()
     }
 
     /// The identifier a call ultimately names.
@@ -173,6 +237,20 @@ impl<'a> Walker<'a> {
     /// an expression, an index, a computed member — is not a name, and is not
     /// guessed at.
     fn callee(&self, n: Node) -> Option<String> {
+        if n.kind().starts_with("jsx_") {
+            let name = n.child_by_field_name("name")?;
+            let text = self.text(name)?;
+            // `<div>` is an HTML element; `<Chart>` is a component defined
+            // somewhere in this project. The capital is how JSX itself tells
+            // them apart, and it is the only signal there is.
+            let is_component = text
+                .chars()
+                .next()
+                .map(|c| c.is_uppercase())
+                .unwrap_or(false);
+            // `<Ns.Thing />` names Thing.
+            return is_component.then(|| text.rsplit('.').next().unwrap_or(&text).to_string());
+        }
         let f = n.child_by_field_name(self.spec.callee_field)?;
         match f.kind() {
             "identifier" | "type_identifier" | "field_identifier" => self.text(f),
@@ -184,6 +262,34 @@ impl<'a> Walker<'a> {
                 self.text(last)
             }
             _ => None,
+        }
+    }
+
+    /// Is this definition part of what the outside world can reach?
+    ///
+    /// It decides the root set for a library, so a rule that is too generous
+    /// makes every function a root and the analysis vacuous — which is what
+    /// one borrowed convention did across all four languages. Each language
+    /// states this its own way, and each states it exactly.
+    fn is_exported(&self, node: Node, name: &str) -> bool {
+        match self.lang {
+            // The compiler enforces this one: a capitalised identifier is
+            // exported from its package, and nothing else is.
+            Language::Go => name.chars().next().map(char::is_uppercase).unwrap_or(false),
+            // `export` is the marker, and it sits above the declaration —
+            // above the binding too, for `export const f = () => {}`.
+            Language::TypeScript => {
+                let mut n = Some(node);
+                while let Some(cur) = n {
+                    if matches!(cur.kind(), "export_statement" | "export_clause") {
+                        return true;
+                    }
+                    n = cur.parent();
+                }
+                false
+            }
+            // Convention, and the only signal Python offers.
+            Language::Python | Language::Rust => !name.starts_with('_'),
         }
     }
 
@@ -215,9 +321,7 @@ impl<'a> Walker<'a> {
                     // exempted on that basis.
                     trait_impl: false,
                     allowed_dead: false,
-                    // Python and Go use a leading underscore for private; TS
-                    // has no marker in the syntax tree worth trusting.
-                    is_pub: !name.starts_with('_'),
+                    is_pub: self.is_exported(node, &name),
                     is_ffi: false,
                     crate_root: self.file.to_path_buf(),
                     self_ty,

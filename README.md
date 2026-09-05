@@ -235,16 +235,18 @@ runs your tool again.
 
 - **Four languages, one of them further along.** Rust, Python, TypeScript and
   Go are read; only Rust has a `--precise` tier, because it is the only one
-  here whose compiler output this tool reads. The Rust frontend has been run
-  against real codebases; the others are new, and have been validated against
-  fixtures rather than against a corpus.
+  here whose compiler output this tool reads. All four have now been run
+  against real codebases; see [docs/languages.md](docs/languages.md) for what
+  each language costs and what is not modelled.
 - **Edges are matched by name**, not resolved by type. A method reached only
   through a generic bound may be reported. Every finding names a file and line,
   and `--explain` shows the whole picture for one symbol.
 - **Entry points are a model, not a fact.** Each language answers for itself:
   a Rust crate through `cargo metadata`, a Go module through `package main`, a
   Python package through a console script or a `__main__`, a Node package
-  through `"bin"`. Rust layout comes from `cargo metadata` where cargo can
+  through `"bin"`, `"private"`, `"engines"` or an `index.html`. The report
+  prints which way it read the project, because getting it wrong makes the
+  tool either silent or wrong about everything. Rust layout comes from `cargo metadata` where cargo can
   answer — targets, kinds and source paths, so tests, benches and examples are
   excluded by cargo's own classification rather than by matching path names.
   Where cargo cannot answer the tool falls back to directory shape. An application (any `[[bin]]`) treats its library
