@@ -32,7 +32,10 @@ fn flagged(name: &str) -> Vec<String> {
 
 fn flagged_graph(name: &str) -> Vec<String> {
     let s = scan_of(name);
-    let mut v: Vec<String> = scan::never_run_graph(&s).into_iter().map(|f| f.name).collect();
+    let mut v: Vec<String> = scan::never_run_graph(&s)
+        .into_iter()
+        .map(|f| f.name)
+        .collect();
     v.sort();
     v
 }
@@ -50,7 +53,10 @@ fn graph_mode_reports_the_whole_dead_region_not_just_its_tip() {
     // `leaf` each have a caller, and that caller merely happens to be dead.
     assert_eq!(flagged("dead_region"), vec!["dead_entry"]);
     // Reachability sees all three.
-    assert_eq!(flagged_graph("dead_region"), vec!["dead_entry", "leaf", "middle"]);
+    assert_eq!(
+        flagged_graph("dead_region"),
+        vec!["dead_entry", "leaf", "middle"]
+    );
 }
 
 #[test]
@@ -130,7 +136,10 @@ fn trait_impl_methods_are_never_accused() {
 
 #[test]
 fn allow_dead_code_is_respected() {
-    assert!(flagged("allow_dead").is_empty(), "the author already decided");
+    assert!(
+        flagged("allow_dead").is_empty(),
+        "the author already decided"
+    );
 }
 
 #[test]
@@ -147,7 +156,10 @@ fn a_name_defined_twice_is_not_judged() {
 fn confidence_is_high_only_when_no_production_caller_exists() {
     for f in scan::never_run(&scan_of("test_only")) {
         assert_eq!(f.confidence, Confidence::High);
-        assert_eq!(f.prod_calls, 0, "High confidence requires zero production callers");
+        assert_eq!(
+            f.prod_calls, 0,
+            "High confidence requires zero production callers"
+        );
     }
 }
 
@@ -156,7 +168,10 @@ fn coverage_is_reported_honestly() {
     // A report that does not say what it could not see overstates itself.
     let (ambiguous, total) = scan::ambiguity_report(&scan_of("ambiguous"));
     assert!(total > 0);
-    assert!(ambiguous > 0, "the ambiguous fixture must register as ambiguous");
+    assert!(
+        ambiguous > 0,
+        "the ambiguous fixture must register as ambiguous"
+    );
 }
 
 // ─── evidence ─────────────────────────────────────────────────

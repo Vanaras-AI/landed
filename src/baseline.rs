@@ -147,9 +147,8 @@ impl Baseline {
     }
 
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let text = std::fs::read_to_string(path).map_err(|e| {
-            anyhow::anyhow!("could not read baseline {}: {e}", path.display())
-        })?;
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("could not read baseline {}: {e}", path.display()))?;
         let b: Baseline = serde_json::from_str(&text)
             .map_err(|e| anyhow::anyhow!("{} is not a valid baseline: {e}", path.display()))?;
         if b.version != 1 {

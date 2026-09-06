@@ -241,8 +241,12 @@ fn dump_mir(dir: &Path) -> anyhow::Result<String> {
         // Never release: it inlines calls away, leaving `scope N (inlined
         // A::process)` annotations instead of call terminators, and the call
         // graph disappears into them.
-        let mut args: Vec<String> =
-            vec!["+nightly".into(), "rustc".into(), "--profile".into(), "test".into()];
+        let mut args: Vec<String> = vec![
+            "+nightly".into(),
+            "rustc".into(),
+            "--profile".into(),
+            "test".into(),
+        ];
         args.extend(sel.iter().cloned());
         args.push("--".into());
         args.push("-Zunpretty=mir".into());
@@ -478,7 +482,10 @@ pub(crate) fn parse(mir: &str) -> Parsed {
             }
             match parse_definition(rest) {
                 Some((id, self_ty)) => {
-                    out.definitions.push(MirDef { id: id.clone(), self_ty });
+                    out.definitions.push(MirDef {
+                        id: id.clone(),
+                        self_ty,
+                    });
                     current = Some(id);
                 }
                 // Unrecognised header: emit nothing, and stop attributing
@@ -520,20 +527,32 @@ mod tests {
     fn a_module_qualifier_is_kept() {
         // Discarding this is what let two same-named functions in different
         // modules merge into one node.
-        assert_eq!(parse_target("alpha::helper"), Some(SymbolId::in_module("helper", "alpha")));
-        assert_eq!(parse_target("a::b::deep"), Some(SymbolId::in_module("deep", "a::b")));
+        assert_eq!(
+            parse_target("alpha::helper"),
+            Some(SymbolId::in_module("helper", "alpha"))
+        );
+        assert_eq!(
+            parse_target("a::b::deep"),
+            Some(SymbolId::in_module("deep", "a::b"))
+        );
         assert_ne!(parse_target("alpha::helper"), parse_target("beta::helper"));
     }
 
     #[test]
     fn a_capitalised_qualifier_is_a_type() {
-        assert_eq!(parse_target("A::process"), Some(SymbolId::typed("process", "A")));
+        assert_eq!(
+            parse_target("A::process"),
+            Some(SymbolId::typed("process", "A"))
+        );
         assert_ne!(parse_target("A::process"), parse_target("B::process"));
     }
 
     #[test]
     fn a_turbofish_is_not_part_of_identity() {
-        assert_eq!(parse_target("generic::<A>"), Some(SymbolId::nominal("generic")));
+        assert_eq!(
+            parse_target("generic::<A>"),
+            Some(SymbolId::nominal("generic"))
+        );
         assert_eq!(
             parse_target("alpha::helper::<u8>"),
             Some(SymbolId::in_module("helper", "alpha"))
@@ -544,8 +563,14 @@ mod tests {
     fn an_unresolved_generic_receiver_is_not_claimed_as_a_type() {
         // `<T as Speak>::speak` — T is not a concrete type, so asserting one
         // would be a lie the analysis would then act on.
-        assert_eq!(parse_target("<T as Speak>::speak"), Some(SymbolId::nominal("speak")));
-        assert_eq!(parse_target("<T as Speak>::speak").unwrap().precision(), Precision::Nominal);
+        assert_eq!(
+            parse_target("<T as Speak>::speak"),
+            Some(SymbolId::nominal("speak"))
+        );
+        assert_eq!(
+            parse_target("<T as Speak>::speak").unwrap().precision(),
+            Precision::Nominal
+        );
     }
 
     #[test]
@@ -573,19 +598,21 @@ mod tests {
 
     #[test]
     fn an_inherent_method_takes_its_receiver_type() {
-        let (id, ty) = parse_definition("<impl at src/main.rs:4:1: 4:7>::process(_1: &A) -> u8 {")
-            .unwrap();
+        let (id, ty) =
+            parse_definition("<impl at src/main.rs:4:1: 4:7>::process(_1: &A) -> u8 {").unwrap();
         assert_eq!(id, SymbolId::typed("process", "A"));
         assert_eq!(ty.as_deref(), Some("A"));
-        let (other, _) = parse_definition("<impl at src/main.rs:5:1: 5:7>::process(_1: &B) -> u8 {")
-            .unwrap();
+        let (other, _) =
+            parse_definition("<impl at src/main.rs:5:1: 5:7>::process(_1: &B) -> u8 {").unwrap();
         assert_ne!(id, other, "same method name, different types");
     }
 
     #[test]
     fn a_closure_is_not_a_definition() {
         // `fn tests::t::{closure#0}(...)` names nothing a call site can reach.
-        assert!(parse_definition("tests::t::{closure#0}(_1: &{closure@x.rs:1:1}) -> R {").is_none());
+        assert!(
+            parse_definition("tests::t::{closure#0}(_1: &{closure@x.rs:1:1}) -> R {").is_none()
+        );
     }
 
     // ── call terminators ──────────────────────────────────────
@@ -711,7 +738,10 @@ fn tests::t() -> () {
             dump(&p)
         );
         // And the closure itself is not a callable definition.
-        assert!(!p.definitions.iter().any(|d| d.id.to_string().contains("closure")));
+        assert!(!p
+            .definitions
+            .iter()
+            .any(|d| d.id.to_string().contains("closure")));
     }
 
     #[test]
@@ -742,17 +772,25 @@ fn 99invalid::thing() -> () {
     #[test]
     fn a_dump_with_no_functions_is_not_read_as_an_empty_program() {
         // Silence here would report every symbol unreachable.
-        let p = parse("// nothing
+        let p = parse(
+            "// nothing
 bb0: {
   _0 = helper() -> [return: bb1];
 }
-");
+",
+        );
         assert!(p.definitions.is_empty());
-        assert!(p.edges.is_empty(), "edges without a caller must not be invented");
+        assert!(
+            p.edges.is_empty(),
+            "edges without a caller must not be invented"
+        );
     }
 
     fn dump(p: &Parsed) -> Vec<String> {
-        p.edges.iter().map(|e| format!("{} -> {}", e.from, e.to)).collect()
+        p.edges
+            .iter()
+            .map(|e| format!("{} -> {}", e.from, e.to))
+            .collect()
     }
 
     // ── test-caller classification ────────────────────────────
@@ -791,7 +829,10 @@ bb0: {
     fn a_name_shared_by_test_and_production_resolves_to_production() {
         // The bug this replaced: a name-keyed set marked every edge out of
         // either as a test edge, removing real production callers.
-        let defs = vec![def("shared_name", None, false), def("shared_name", None, true)];
+        let defs = vec![
+            def("shared_name", None, false),
+            def("shared_name", None, true),
+        ];
         assert!(
             !caller_is_test(&SymbolId::nominal("shared_name"), &defs),
             "ambiguity must fail closed to production"

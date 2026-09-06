@@ -10,7 +10,10 @@ use std::process::Command;
 const BIN: &str = env!("CARGO_BIN_EXE_landed");
 
 fn e(name: &str, file: &str) -> Entry {
-    Entry { name: name.into(), file: file.into() }
+    Entry {
+        name: name.into(),
+        file: file.into(),
+    }
 }
 
 #[test]
@@ -59,7 +62,11 @@ fn a_baseline_round_trips_through_disk() {
     assert_eq!(back.mode, Mode::Graph);
     assert_eq!(back.accepted, base.accepted);
     // The timestamp should be readable, not a raw epoch count.
-    assert!(back.created.contains('T') && back.created.ends_with('Z'), "got {}", back.created);
+    assert!(
+        back.created.contains('T') && back.created.ends_with('Z'),
+        "got {}",
+        back.created
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -69,10 +76,20 @@ fn a_corrupt_baseline_fails_loudly() {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("b.json");
     std::fs::write(&path, "{ not json").unwrap();
-    assert!(Baseline::load(&path).is_err(), "must not silently accept garbage");
-    std::fs::write(&path, r#"{"version":99,"created":"x","mode":"direct","accepted":[]}"#).unwrap();
+    assert!(
+        Baseline::load(&path).is_err(),
+        "must not silently accept garbage"
+    );
+    std::fs::write(
+        &path,
+        r#"{"version":99,"created":"x","mode":"direct","accepted":[]}"#,
+    )
+    .unwrap();
     let err = Baseline::load(&path).unwrap_err().to_string();
-    assert!(err.contains("version"), "a future schema must be refused, not misread: {err}");
+    assert!(
+        err.contains("version"),
+        "a future schema must be refused, not misread: {err}"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -115,16 +132,25 @@ mod tests {
 fn ci_flow_green_then_red() {
     let dir = scratch("ci", WITH_ONE_DEAD);
 
-    let taken = Command::new(BIN).args(["baseline", dir.to_str().unwrap()]).output().unwrap();
+    let taken = Command::new(BIN)
+        .args(["baseline", dir.to_str().unwrap()])
+        .output()
+        .unwrap();
     assert!(taken.status.success());
-    assert!(dir.join(".landed-baseline.json").is_file(), "baseline must be written");
+    assert!(
+        dir.join(".landed-baseline.json").is_file(),
+        "baseline must be written"
+    );
 
     // Unchanged: green.
     let clean = Command::new(BIN)
         .args(["check", dir.to_str().unwrap(), "--baseline"])
         .output()
         .unwrap();
-    assert!(clean.status.success(), "an unchanged codebase must not fail CI");
+    assert!(
+        clean.status.success(),
+        "an unchanged codebase must not fail CI"
+    );
 
     // One new dead function: red, and it names it.
     std::fs::write(dir.join("src/main.rs"), WITH_TWO_DEAD).unwrap();
@@ -132,10 +158,20 @@ fn ci_flow_green_then_red() {
         .args(["check", dir.to_str().unwrap(), "--baseline"])
         .output()
         .unwrap();
-    assert_eq!(dirty.status.code(), Some(1), "new unreachable code must fail CI");
+    assert_eq!(
+        dirty.status.code(),
+        Some(1),
+        "new unreachable code must fail CI"
+    );
     let out = String::from_utf8_lossy(&dirty.stdout);
-    assert!(out.contains("dead_b"), "the new finding must be named; got: {out}");
-    assert!(!out.contains("dead_a"), "accepted findings must not be re-reported; got: {out}");
+    assert!(
+        out.contains("dead_b"),
+        "the new finding must be named; got: {out}"
+    );
+    assert!(
+        !out.contains("dead_a"),
+        "accepted findings must not be re-reported; got: {out}"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -153,7 +189,10 @@ fn a_baseline_from_the_other_mode_is_refused() {
         .args(["check", dir.to_str().unwrap(), "--baseline"])
         .output()
         .unwrap();
-    assert!(!out.status.success(), "mismatched modes must not silently compare");
+    assert!(
+        !out.status.success(),
+        "mismatched modes must not silently compare"
+    );
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.to_lowercase().contains("mode"), "got: {err}");
     std::fs::remove_dir_all(&dir).ok();

@@ -7,7 +7,7 @@
 //! analyzer cannot infer, and their statement outranks the heuristic.
 
 use landed::scan;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn scratch(name: &str, main_rs: &str, config: Option<&str>) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("landed-cfg-{name}-{}", std::process::id()));
@@ -36,9 +36,12 @@ fn do_work() {}
 mod tests { #[test] fn t() { super::handle_webhook(); } }
 "#;
 
-fn dead_names(dir: &PathBuf) -> Vec<String> {
+fn dead_names(dir: &Path) -> Vec<String> {
     let s = scan::scan_crate(dir).unwrap();
-    let mut v: Vec<String> = scan::never_run_graph(&s).into_iter().map(|f| f.name).collect();
+    let mut v: Vec<String> = scan::never_run_graph(&s)
+        .into_iter()
+        .map(|f| f.name)
+        .collect();
     v.sort();
     v
 }
@@ -49,13 +52,20 @@ fn without_config_a_spawned_entry_point_is_wrongly_condemned() {
     // failing, the analyzer got better and the test should be revisited.
     let dir = scratch("none", SPAWNED_ENTRY, None);
     let names = dead_names(&dir);
-    assert!(names.contains(&"handle_webhook".to_string()), "got {names:?}");
+    assert!(
+        names.contains(&"handle_webhook".to_string()),
+        "got {names:?}"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
 fn a_declared_root_makes_it_and_everything_downstream_live() {
-    let dir = scratch("root", SPAWNED_ENTRY, Some("roots = [\"handle_webhook\"]\n"));
+    let dir = scratch(
+        "root",
+        SPAWNED_ENTRY,
+        Some("roots = [\"handle_webhook\"]\n"),
+    );
     assert!(
         dead_names(&dir).is_empty(),
         "declaring the entry point must rescue the whole region beneath it"
@@ -72,7 +82,11 @@ fn a_wildcard_root_matches() {
 
 #[test]
 fn ignored_names_are_never_reported() {
-    let dir = scratch("ign", SPAWNED_ENTRY, Some("ignore = [\"handle_*\", \"do_work\"]\n"));
+    let dir = scratch(
+        "ign",
+        SPAWNED_ENTRY,
+        Some("ignore = [\"handle_*\", \"do_work\"]\n"),
+    );
     assert!(dead_names(&dir).is_empty());
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -81,7 +95,10 @@ fn ignored_names_are_never_reported() {
 fn an_ignore_does_not_silence_unrelated_findings() {
     let dir = scratch("ign2", SPAWNED_ENTRY, Some("ignore = [\"do_work\"]\n"));
     let names = dead_names(&dir);
-    assert!(names.contains(&"handle_webhook".to_string()), "got {names:?}");
+    assert!(
+        names.contains(&"handle_webhook".to_string()),
+        "got {names:?}"
+    );
     assert!(!names.contains(&"do_work".to_string()), "got {names:?}");
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -93,7 +110,10 @@ fn a_malformed_config_does_not_silently_disable_itself() {
     // again with no indication why.
     let dir = scratch("bad", SPAWNED_ENTRY, Some("roots = \"not a list\"\n"));
     let cfg = landed::config::Config::load(&dir);
-    assert!(cfg.is_err(), "a malformed landed.toml must be an error, not a default");
+    assert!(
+        cfg.is_err(),
+        "a malformed landed.toml must be an error, not a default"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -102,6 +122,9 @@ fn an_unknown_key_is_rejected_rather_than_ignored() {
     // A misspelled key that is silently accepted is a config that does
     // nothing while appearing to work.
     let dir = scratch("unk", SPAWNED_ENTRY, Some("rootz = [\"handle_webhook\"]\n"));
-    assert!(landed::config::Config::load(&dir).is_err(), "typo must be caught");
+    assert!(
+        landed::config::Config::load(&dir).is_err(),
+        "typo must be caught"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }

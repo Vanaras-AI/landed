@@ -119,7 +119,10 @@ impl Scan {
         for e in &ex.edges {
             let from = e.from.to_string();
             for target in targets_of(&e.to) {
-                edges.entry(from.clone()).or_default().insert(target.clone());
+                edges
+                    .entry(from.clone())
+                    .or_default()
+                    .insert(target.clone());
 
                 let entry = calls.entry(target).or_default();
                 if e.in_test {
@@ -129,7 +132,9 @@ impl Scan {
                         // know where they were written. An absent location is
                         // omitted rather than printed as ":0".
                         if entry.examples.len() < 3 && e.line > 0 {
-                            entry.examples.push(format!("{}:{}", e.file.display(), e.line));
+                            entry
+                                .examples
+                                .push(format!("{}:{}", e.file.display(), e.line));
                         }
                     }
                 } else {
@@ -195,9 +200,29 @@ pub fn resolve_roots(path: &Path) -> Vec<PathBuf> {
 
 /// Names that are always reachable or conventionally unreferenced.
 const ALWAYS_LIVE: &[&str] = &[
-    "main", "new", "default", "fmt", "from", "from_str", "try_from", "drop", "clone",
-    "next", "poll", "deref", "deref_mut", "eq", "ne", "hash", "cmp", "partial_cmp",
-    "serialize", "deserialize", "into", "as_ref", "borrow",
+    "main",
+    "new",
+    "default",
+    "fmt",
+    "from",
+    "from_str",
+    "try_from",
+    "drop",
+    "clone",
+    "next",
+    "poll",
+    "deref",
+    "deref_mut",
+    "eq",
+    "ne",
+    "hash",
+    "cmp",
+    "partial_cmp",
+    "serialize",
+    "deserialize",
+    "into",
+    "as_ref",
+    "borrow",
 ];
 
 /// How far the analyzer trusts a finding.
@@ -246,7 +271,13 @@ pub fn never_run(scan: &Scan) -> Vec<Finding> {
         }
         // A name defined more than once is ambiguous under name-based matching;
         // skip it rather than risk a false positive.
-        if scan.defs.iter().filter(|o| o.key() == d.key() && !o.in_test).count() > 1 {
+        if scan
+            .defs
+            .iter()
+            .filter(|o| o.key() == d.key() && !o.in_test)
+            .count()
+            > 1
+        {
             continue;
         }
         if let Some(c) = scan.calls.get(&d.key()) {
@@ -310,7 +341,7 @@ pub fn production_roots(scan: &Scan) -> std::collections::HashSet<String> {
     // them.
     if !scan.entry_files.is_empty() {
         for d in &scan.defs {
-            if d.is_pub && !d.in_test && scan.entry_files.iter().any(|f| *f == d.file) {
+            if d.is_pub && !d.in_test && scan.entry_files.contains(&d.file) {
                 roots.insert(d.key());
             }
         }
@@ -419,7 +450,11 @@ pub fn never_run_graph(scan: &Scan) -> Vec<Finding> {
                 line: d.line,
                 test_calls: c.map(|c| c.test).unwrap_or(0),
                 examples: c.map(|c| c.examples.clone()).unwrap_or_default(),
-                confidence: if prod_calls == 0 { Confidence::High } else { Confidence::Medium },
+                confidence: if prod_calls == 0 {
+                    Confidence::High
+                } else {
+                    Confidence::Medium
+                },
                 prod_calls,
             });
         }
@@ -542,7 +577,12 @@ pub fn dead_regions(scan: &Scan) -> Vec<Region> {
         seen.insert(start);
         while let Some(n) = queue.pop() {
             component.push(n);
-            for nb in fwd.get(n).into_iter().flatten().chain(rev.get(n).into_iter().flatten()) {
+            for nb in fwd
+                .get(n)
+                .into_iter()
+                .flatten()
+                .chain(rev.get(n).into_iter().flatten())
+            {
                 if seen.insert(nb) {
                     queue.push(nb);
                 }
@@ -647,7 +687,11 @@ pub fn evidence(scan: &Scan, name: &str) -> Evidence {
         .iter()
         .filter(|(_, tos)| tos.contains(name))
         .map(|(from, _)| {
-            let label = if from.is_empty() { "<module level>".to_string() } else { from.clone() };
+            let label = if from.is_empty() {
+                "<module level>".to_string()
+            } else {
+                from.clone()
+            };
             (label, prod.contains(from))
         })
         .collect();
@@ -658,9 +702,7 @@ pub fn evidence(scan: &Scan, name: &str) -> Evidence {
         Some(d) if d.is_ffi => "#[no_mangle] / extern",
         Some(d) if d.trait_impl => "trait impl method (dynamic dispatch)",
         Some(_) if scan.reexported.contains(name) => "re-exported at crate root",
-        Some(d)
-            if d.is_pub && scan.entry_files.iter().any(|f| *f == d.file) =>
-        {
+        Some(d) if d.is_pub && scan.entry_files.contains(&d.file) => {
             "exported from the entry module a host loads"
         }
         Some(d) if d.is_pub && !is_application(scan) => "public API of a library crate",
@@ -668,7 +710,12 @@ pub fn evidence(scan: &Scan, name: &str) -> Evidence {
         _ => "not a root",
     };
 
-    let ambiguous = scan.defs.iter().filter(|o| o.name() == name && !o.in_test).count() > 1;
+    let ambiguous = scan
+        .defs
+        .iter()
+        .filter(|o| o.name() == name && !o.in_test)
+        .count()
+        > 1;
     let suppressed = match d0 {
         None => Some("no definition found in the scanned crates"),
         Some(d) if d.in_test => Some("defined in test code"),
@@ -681,7 +728,10 @@ pub fn evidence(scan: &Scan, name: &str) -> Evidence {
 
     Evidence {
         name: name.to_string(),
-        defined: defs.iter().map(|d| (d.file.display().to_string(), d.line)).collect(),
+        defined: defs
+            .iter()
+            .map(|d| (d.file.display().to_string(), d.line))
+            .collect(),
         in_production_set: prod.contains(name),
         in_test_set: test.contains(name),
         is_root: roots.contains(name),

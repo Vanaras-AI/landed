@@ -15,9 +15,16 @@ fn here() -> PathBuf {
 #[test]
 fn cargo_answers_for_a_real_crate() {
     let ws = targets::discover(&here());
-    assert!(ws.from_cargo, "landed is a cargo project; cargo should answer");
+    assert!(
+        ws.from_cargo,
+        "landed is a cargo project; cargo should answer"
+    );
     assert!(ws.is_application(), "it has a [[bin]]");
-    assert!(ws.binary_names().contains(&"landed".to_string()), "{:?}", ws.binary_names());
+    assert!(
+        ws.binary_names().contains(&"landed".to_string()),
+        "{:?}",
+        ws.binary_names()
+    );
 }
 
 #[test]
@@ -31,7 +38,9 @@ fn test_targets_are_excluded_from_production_sources() {
         "tests/ must not be a production source dir; got {dirs:?}"
     );
     assert!(
-        ws.non_production_roots().iter().any(|d| d.ends_with("tests")),
+        ws.non_production_roots()
+            .iter()
+            .any(|d| d.ends_with("tests")),
         "tests/ should be classified as non-production"
     );
 }
@@ -90,16 +99,23 @@ fn a_baseline_with_no_fingerprint_says_so() {
     // which is itself worth telling the user rather than assuming fresh.
     let b = baseline::Baseline::with_fingerprint(baseline::Mode::Direct, [], None);
     let why = b.staleness(&baseline::Fingerprint::of(&Default::default()));
-    assert!(why.is_some(), "an unfingerprinted baseline is not known to be current");
+    assert!(
+        why.is_some(),
+        "an unfingerprinted baseline is not known to be current"
+    );
 }
 
 #[test]
 fn the_fingerprint_is_order_independent() {
     // Reordering entries in landed.toml is not a change in meaning.
-    let mut a = landed::config::Config::default();
-    a.roots = vec!["x".into(), "y".into()];
-    let mut b = landed::config::Config::default();
-    b.roots = vec!["y".into(), "x".into()];
+    let a = landed::config::Config {
+        roots: vec!["x".into(), "y".into()],
+        ..Default::default()
+    };
+    let b = landed::config::Config {
+        roots: vec!["y".into(), "x".into()],
+        ..Default::default()
+    };
     assert_eq!(
         baseline::Fingerprint::of(&a).config_digest,
         baseline::Fingerprint::of(&b).config_digest
@@ -125,7 +141,10 @@ fn sarif_is_well_formed() {
     assert!(v["$schema"].as_str().unwrap().contains("sarif"));
     let driver = &v["runs"][0]["tool"]["driver"];
     assert_eq!(driver["name"], "landed");
-    assert!(driver["rules"].as_array().unwrap().len() >= 3, "rules must be declared");
+    assert!(
+        driver["rules"].as_array().unwrap().len() >= 3,
+        "rules must be declared"
+    );
 }
 
 #[test]
@@ -139,7 +158,10 @@ fn every_sarif_result_can_be_placed_in_a_file() {
         assert!(loc["artifactLocation"]["uri"].is_string(), "{r}");
         assert!(loc["region"]["startLine"].as_u64().unwrap() >= 1, "{r}");
         assert!(r["ruleId"].is_string(), "{r}");
-        assert!(r["partialFingerprints"].is_object(), "results must be trackable across runs");
+        assert!(
+            r["partialFingerprints"].is_object(),
+            "results must be trackable across runs"
+        );
     }
 }
 

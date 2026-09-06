@@ -37,7 +37,10 @@ impl Kind {
             Kind::Bin
         } else if kinds.iter().any(|k| k == "custom-build") {
             Kind::BuildScript
-        } else if kinds.iter().any(|k| k == "test" || k == "bench" || k == "example") {
+        } else if kinds
+            .iter()
+            .any(|k| k == "test" || k == "bench" || k == "example")
+        {
             Kind::NotProduction
         } else {
             Kind::Lib
@@ -184,14 +187,20 @@ pub fn discover(path: &Path) -> Workspace {
     // whichever ancestor is one. Only trust the answer when it actually
     // describes the path we were asked about.
     let canon = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-    let describes_this_path = targets
-        .iter()
-        .any(|t| t.src_path.canonicalize().unwrap_or_else(|_| t.src_path.clone()).starts_with(&canon));
+    let describes_this_path = targets.iter().any(|t| {
+        t.src_path
+            .canonicalize()
+            .unwrap_or_else(|_| t.src_path.clone())
+            .starts_with(&canon)
+    });
 
     if !describes_this_path {
         return Workspace::default();
     }
 
     let from_cargo = !targets.is_empty();
-    Workspace { targets, from_cargo }
+    Workspace {
+        targets,
+        from_cargo,
+    }
 }

@@ -49,8 +49,14 @@ fn summarize(scan: &Scan, findings: &[Finding], regions: usize) -> Summary {
         production_functions: scan.defs.iter().filter(|d| !d.in_test).count(),
         unanalysable_names: unanalysable,
         unreachable: findings.len(),
-        confident: findings.iter().filter(|f| f.confidence == Confidence::High).count(),
-        uncertain: findings.iter().filter(|f| f.confidence == Confidence::Medium).count(),
+        confident: findings
+            .iter()
+            .filter(|f| f.confidence == Confidence::High)
+            .count(),
+        uncertain: findings
+            .iter()
+            .filter(|f| f.confidence == Confidence::Medium)
+            .count(),
         regions,
         nominal_findings: scan.nominal_findings,
     }
@@ -264,7 +270,13 @@ pub fn sarif(
                     "{} is never called outside tests ({} test call(s), {} from production)",
                     f.name, f.test_calls, f.prod_calls
                 );
-                push(rule, level, text, &crate::baseline::relative(&f.file, root), f.line);
+                push(
+                    rule,
+                    level,
+                    text,
+                    &crate::baseline::relative(&f.file, root),
+                    f.line,
+                );
             }
         }
     }

@@ -19,7 +19,10 @@ fn fixture(name: &str) -> String {
 }
 
 fn run(args: &[&str]) -> String {
-    let out = Command::new(BIN).args(args).output().expect("binary should run");
+    let out = Command::new(BIN)
+        .args(args)
+        .output()
+        .expect("binary should run");
     assert!(
         out.status.success() || out.status.code() == Some(1),
         "unexpected exit: {:?}",
@@ -46,14 +49,20 @@ fn graph_groups_into_regions_and_names_the_frontier() {
 #[test]
 fn flat_bypasses_regions() {
     let o = run(&["check", &fixture("dead_region"), "--graph", "--flat"]);
-    assert!(o.contains("NEVER RUN"), "expected the flat listing; got: {o}");
+    assert!(
+        o.contains("NEVER RUN"),
+        "expected the flat listing; got: {o}"
+    );
     assert!(!o.contains("Region 1"), "--flat must not group; got: {o}");
 }
 
 #[test]
 fn stats_reports_coverage_and_nothing_else() {
     let o = run(&["check", &fixture("ambiguous"), "--stats"]);
-    assert!(o.contains("non-unique names"), "--stats did nothing; got: {o}");
+    assert!(
+        o.contains("non-unique names"),
+        "--stats did nothing; got: {o}"
+    );
     assert!(
         !o.contains("NEVER RUN") && !o.contains("Region 1"),
         "--stats must not fall through to a report; got: {o}"
@@ -65,7 +74,10 @@ fn dot_emits_a_graph_and_nothing_else() {
     let o = run(&["check", &fixture("dead_region"), "--dot"]);
     assert!(o.starts_with("digraph calls {"), "got: {o}");
     assert!(o.trim_end().ends_with('}'), "got: {o}");
-    assert!(!o.contains("landed v"), "--dot must emit only DOT; got: {o}");
+    assert!(
+        !o.contains("landed v"),
+        "--dot must emit only DOT; got: {o}"
+    );
 }
 
 #[test]
@@ -74,7 +86,10 @@ fn explain_shows_evidence_for_one_symbol() {
     assert!(o.contains("status"), "got: {o}");
     assert!(o.contains("call sites"), "got: {o}");
     assert!(o.contains("callers"), "got: {o}");
-    assert!(!o.contains("Region 1"), "--explain must not fall through; got: {o}");
+    assert!(
+        !o.contains("Region 1"),
+        "--explain must not fall through; got: {o}"
+    );
 }
 
 #[test]
@@ -95,7 +110,10 @@ fn json_summary_states_what_could_not_be_analysed() {
     let o = run(&["check", &fixture("ambiguous"), "--json"]);
     let v: serde_json::Value = serde_json::from_str(&o).unwrap();
     assert!(v["summary"]["production_functions"].is_number(), "got: {o}");
-    assert!(v["summary"]["unanalysable_names"].as_u64().unwrap() > 0, "got: {o}");
+    assert!(
+        v["summary"]["unanalysable_names"].as_u64().unwrap() > 0,
+        "got: {o}"
+    );
 }
 
 #[test]
@@ -111,9 +129,18 @@ fn graph_json_reports_regions_with_confidence() {
 
 #[test]
 fn github_format_annotates_the_source_line() {
-    let o = run(&["check", &fixture("dead_region"), "--graph", "--format", "github"]);
+    let o = run(&[
+        "check",
+        &fixture("dead_region"),
+        "--graph",
+        "--format",
+        "github",
+    ]);
     assert!(o.starts_with("::warning file="), "got: {o}");
-    assert!(o.contains("line="), "an annotation without a line cannot be placed; got: {o}");
+    assert!(
+        o.contains("line="),
+        "an annotation without a line cannot be placed; got: {o}"
+    );
     assert!(o.contains("dead_entry"), "got: {o}");
     assert!(!o.contains("landed v"), "annotations only; got: {o}");
 }
@@ -121,8 +148,18 @@ fn github_format_annotates_the_source_line() {
 #[test]
 fn github_format_annotates_one_line_per_region_not_per_function() {
     // Forty annotations for one dead subsystem buries the diff.
-    let o = run(&["check", &fixture("dead_region"), "--graph", "--format", "github"]);
-    assert_eq!(o.lines().count(), 1, "three dead functions, one region; got: {o}");
+    let o = run(&[
+        "check",
+        &fixture("dead_region"),
+        "--graph",
+        "--format",
+        "github",
+    ]);
+    assert_eq!(
+        o.lines().count(),
+        1,
+        "three dead functions, one region; got: {o}"
+    );
 }
 
 #[test]
@@ -131,10 +168,19 @@ fn fail_over_gates_the_exit_code() {
         .args(["check", &fixture("all_live"), "--fail-over", "0"])
         .output()
         .unwrap();
-    assert!(clean.status.success(), "a clean crate must not fail the build");
+    assert!(
+        clean.status.success(),
+        "a clean crate must not fail the build"
+    );
 
     let dirty = Command::new(BIN)
-        .args(["check", &fixture("dead_region"), "--graph", "--fail-over", "1"])
+        .args([
+            "check",
+            &fixture("dead_region"),
+            "--graph",
+            "--fail-over",
+            "1",
+        ])
         .output()
         .unwrap();
     assert_eq!(

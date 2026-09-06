@@ -225,9 +225,12 @@ impl<'a> Walker<'a> {
         let name = parent.child_by_field_name(field)?;
         // Only a plain identifier is a name. Destructuring, a computed key
         // and a member assignment are not, and are not guessed at.
-        matches!(name.kind(), "identifier" | "property_identifier" | "type_identifier")
-            .then(|| self.text(name))
-            .flatten()
+        matches!(
+            name.kind(),
+            "identifier" | "property_identifier" | "type_identifier"
+        )
+        .then(|| self.text(name))
+        .flatten()
     }
 
     /// The identifier a call ultimately names.

@@ -40,8 +40,8 @@ impl Config {
             let f = dir.join("landed.toml");
             if f.is_file() {
                 let text = std::fs::read_to_string(&f)?;
-                let c: Config = toml::from_str(&text)
-                    .map_err(|e| anyhow::anyhow!("{}: {e}", f.display()))?;
+                let c: Config =
+                    toml::from_str(&text).map_err(|e| anyhow::anyhow!("{}: {e}", f.display()))?;
                 return Ok(c);
             }
         }

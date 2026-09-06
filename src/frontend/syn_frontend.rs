@@ -93,7 +93,8 @@ fn tokens_without_strings(a: &syn::Attribute) -> String {
 }
 
 fn mentions_test_ident(s: &str) -> bool {
-    s.split(|c: char| !c.is_alphanumeric() && c != '_').any(|w| w == "test")
+    s.split(|c: char| !c.is_alphanumeric() && c != '_')
+        .any(|w| w == "test")
 }
 
 /// `#[cfg(test)]`, matched as a whole identifier with strings stripped so

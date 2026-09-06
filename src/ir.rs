@@ -51,17 +51,29 @@ pub struct SymbolId {
 impl SymbolId {
     /// A name and nothing else — everything a syntactic frontend can promise.
     pub fn nominal(name: impl Into<String>) -> Self {
-        Self { name: name.into(), self_ty: None, path: None }
+        Self {
+            name: name.into(),
+            self_ty: None,
+            path: None,
+        }
     }
 
     /// A method whose receiver type is known.
     pub fn typed(name: impl Into<String>, self_ty: impl Into<String>) -> Self {
-        Self { name: name.into(), self_ty: Some(self_ty.into()), path: None }
+        Self {
+            name: name.into(),
+            self_ty: Some(self_ty.into()),
+            path: None,
+        }
     }
 
     /// A free function qualified by the module it lives in.
     pub fn in_module(name: impl Into<String>, path: impl Into<String>) -> Self {
-        Self { name: name.into(), self_ty: None, path: Some(path.into()) }
+        Self {
+            name: name.into(),
+            self_ty: None,
+            path: Some(path.into()),
+        }
     }
 
     /// The precision this id carries on its own, before any frontend claim.

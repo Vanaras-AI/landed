@@ -1,0 +1,52 @@
+# A tool that asks to gate other people's CI has to survive its own.
+#
+# The three jobs are deliberately separate: a formatting failure should not
+# hide a test failure, and the dogfood job failing means the tool disagrees
+# with itself, which is a different kind of problem from a broken build.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - name: Build with warnings denied
+        # A warning shipped once already: --stats was parsed, bound, and did
+        # nothing for a release, because the build filtered output to errors.
+        run: cargo build --locked --release
+        env:
+          RUSTFLAGS: -D warnings
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked --release
+
+  dogfood:
+    # The tool is run against itself. It reports nothing today, and if that
+    # changes the change should be deliberate, not discovered later.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --release
+      - name: landed on landed
+        run: ./target/release/landed check . --graph --fail-over 1
+      - name: the analysis is reproducible
+        # Two runs must agree exactly. Hash iteration order made them
+        # disagree three times out of three before the comparators were
+        # made total; a baseline diff that reports churn not in the code
+        # destroys trust in the tool faster than a missed finding.
+        run: |
+          ./target/release/landed check . --graph --json > /tmp/a.json
+          ./target/release/landed check . --graph --json > /tmp/b.json
+          diff /tmp/a.json /tmp/b.json

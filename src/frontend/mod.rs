@@ -6,12 +6,12 @@
 //! learns which one ran.
 
 pub mod mir_frontend;
-pub mod tree_sitter_frontend;
 pub mod syn_frontend;
+pub mod tree_sitter_frontend;
 
 pub use mir_frontend::MirFrontend;
-pub use tree_sitter_frontend::TreeSitterFrontend;
 pub use syn_frontend::SynFrontend;
+pub use tree_sitter_frontend::TreeSitterFrontend;
 
 use crate::ir::{Extract, Frontend, Precision};
 use std::path::Path;
@@ -40,10 +40,7 @@ pub fn for_tier(tier: Tier) -> anyhow::Result<Box<dyn Frontend>> {
 /// Only Rust has a precise tier: it is the only language here with a compiler
 /// whose resolved output this tool reads. Asking for precision elsewhere is an
 /// error rather than a silent downgrade — the same rule the Rust tiers follow.
-pub fn for_tier_in(
-    tier: Tier,
-    lang: crate::lang::Language,
-) -> anyhow::Result<Box<dyn Frontend>> {
+pub fn for_tier_in(tier: Tier, lang: crate::lang::Language) -> anyhow::Result<Box<dyn Frontend>> {
     use crate::lang::Language;
     match (tier, lang) {
         (Tier::Default, Language::Rust) => Ok(Box::new(SynFrontend)),

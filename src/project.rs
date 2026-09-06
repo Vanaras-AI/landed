@@ -111,7 +111,10 @@ pub struct CargoProject {
 
 impl CargoProject {
     pub fn new(root: &Path) -> Self {
-        Self { root: root.to_path_buf(), workspace: crate::targets::discover(root) }
+        Self {
+            root: root.to_path_buf(),
+            workspace: crate::targets::discover(root),
+        }
     }
 
     pub fn workspace(&self) -> &crate::targets::Workspace {
@@ -137,8 +140,7 @@ impl Project for CargoProject {
         } else {
             crate::frontend::syn_frontend::resolve_roots(&self.root)
         };
-        let mut v: Vec<PathBuf> =
-            dirs.iter().flat_map(|d| walk(d, Language::Rust)).collect();
+        let mut v: Vec<PathBuf> = dirs.iter().flat_map(|d| walk(d, Language::Rust)).collect();
         v.sort();
         v.dedup();
         v
@@ -176,7 +178,11 @@ impl Project for CargoProject {
             format!(
                 "rust, {} cargo target(s); {}",
                 self.workspace.targets.len(),
-                if self.is_application() { "application" } else { "library" }
+                if self.is_application() {
+                    "application"
+                } else {
+                    "library"
+                }
             )
         } else {
             "rust, cargo could not answer; directory conventions used".into()
@@ -196,7 +202,10 @@ pub struct ConventionProject {
 
 impl ConventionProject {
     pub fn new(root: &Path, lang: Language) -> Self {
-        Self { root: root.to_path_buf(), lang }
+        Self {
+            root: root.to_path_buf(),
+            lang,
+        }
     }
 }
 
@@ -218,9 +227,7 @@ impl Project for ConventionProject {
             || s.contains("/spec/");
         match self.lang {
             // pytest and unittest both key on the filename.
-            Language::Python => {
-                in_test_dir || stem.starts_with("test_") || stem.ends_with("_test")
-            }
+            Language::Python => in_test_dir || stem.starts_with("test_") || stem.ends_with("_test"),
             // jest, vitest and mocha all use these.
             Language::TypeScript => {
                 in_test_dir
@@ -306,7 +313,9 @@ impl Project for ConventionProject {
 
         let mut out = Vec::new();
         for key in ["main", "module"] {
-            let Some(decl) = json.get(key).and_then(|v| v.as_str()) else { continue };
+            let Some(decl) = json.get(key).and_then(|v| v.as_str()) else {
+                continue;
+            };
             // The manifest names the *built* file. Sources are what is
             // analysed, so the declaration is mapped back: the build
             // directory becomes a source directory, and the extension becomes
@@ -314,7 +323,11 @@ impl Project for ConventionProject {
             let rel = decl.trim_start_matches("./");
             let stem = rel.rsplit_once('.').map(|(a, _)| a).unwrap_or(rel);
             let tail = stem.split_once('/').map(|(head, rest)| {
-                if matches!(head, "out" | "dist" | "build" | "lib") { rest } else { stem }
+                if matches!(head, "out" | "dist" | "build" | "lib") {
+                    rest
+                } else {
+                    stem
+                }
             });
             for candidate in [tail.unwrap_or(stem), stem] {
                 for dir in ["src", ""] {
@@ -347,7 +360,11 @@ impl Project for ConventionProject {
         format!(
             "{}, by convention; {}",
             self.lang.name(),
-            if self.is_application() { "application" } else { "library" }
+            if self.is_application() {
+                "application"
+            } else {
+                "library"
+            }
         )
     }
 }

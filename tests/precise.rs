@@ -4,7 +4,7 @@
 //! they skip rather than fail — the tier is opt-in, and CI without nightly is
 //! an ordinary situation, not a broken one.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const BIN: &str = env!("CARGO_BIN_EXE_landed");
@@ -30,7 +30,7 @@ fn scratch(name: &str, main_rs: &str) -> PathBuf {
     dir
 }
 
-fn findings(dir: &PathBuf, precise: bool) -> Vec<String> {
+fn findings(dir: &Path, precise: bool) -> Vec<String> {
     let mut args = vec!["check", dir.to_str().unwrap(), "--graph", "--json"];
     if precise {
         args.push("--precise");
@@ -55,7 +55,7 @@ fn findings(dir: &PathBuf, precise: bool) -> Vec<String> {
     names
 }
 
-fn ambiguity(dir: &PathBuf, precise: bool) -> f64 {
+fn ambiguity(dir: &Path, precise: bool) -> f64 {
     let mut args = vec!["check", dir.to_str().unwrap(), "--stats"];
     if precise {
         args.push("--precise");
@@ -102,7 +102,10 @@ fn same_named_methods_on_different_types_are_distinguished() {
     // Precise: B::run and its helper are reported, named by type.
     let precise = findings(&dir, true);
     assert!(precise.contains(&"B::run".to_string()), "got {precise:?}");
-    assert!(!precise.contains(&"A::run".to_string()), "A::run is live; got {precise:?}");
+    assert!(
+        !precise.contains(&"A::run".to_string()),
+        "A::run is live; got {precise:?}"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -114,8 +117,14 @@ fn precise_reduces_measured_ambiguity() {
     }
     let dir = scratch("amb", SAME_NAME_METHODS);
     let (before, after) = (ambiguity(&dir, false), ambiguity(&dir, true));
-    assert!(before > 0.0, "the fixture must be ambiguous under the nominal tier");
-    assert!(after < before, "precise must reduce ambiguity: {before}% -> {after}%");
+    assert!(
+        before > 0.0,
+        "the fixture must be ambiguous under the nominal tier"
+    );
+    assert!(
+        after < before,
+        "precise must reduce ambiguity: {before}% -> {after}%"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -151,9 +160,15 @@ fn precise_refuses_a_path_that_is_not_a_cargo_crate() {
         .args(["check", fixtures.to_str().unwrap(), "--precise"])
         .output()
         .unwrap();
-    assert!(!out.status.success(), "must fail rather than fall back to nominal");
+    assert!(
+        !out.status.success(),
+        "must fail rather than fall back to nominal"
+    );
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("cargo crate"), "the reason must be actionable: {err}");
+    assert!(
+        err.contains("cargo crate"),
+        "the reason must be actionable: {err}"
+    );
 }
 
 #[test]
@@ -167,7 +182,10 @@ fn precise_refuses_a_crate_that_does_not_compile() {
         .args(["check", dir.to_str().unwrap(), "--precise"])
         .output()
         .unwrap();
-    assert!(!out.status.success(), "must fail rather than answer with less");
+    assert!(
+        !out.status.success(),
+        "must fail rather than answer with less"
+    );
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
         err.contains("could not produce MIR") || err.contains("compile"),
@@ -271,7 +289,10 @@ fn case_c_same_method_name_on_different_types_both_live() {
     }
     let dir = scratch("case_c", CASE_C);
     let found = findings(&dir, true);
-    assert!(found.is_empty(), "both are reached from main; got {found:?}");
+    assert!(
+        found.is_empty(),
+        "both are reached from main; got {found:?}"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -296,9 +317,18 @@ fn case_d_production_and_test_reachability_are_distinguished() {
     let dir = scratch("case_d", CASE_D);
     let found = findings(&dir, true);
     assert!(found.contains(&"B::process".to_string()), "got {found:?}");
-    assert!(found.contains(&"only_b".to_string()), "downstream too; got {found:?}");
-    assert!(!found.contains(&"A::process".to_string()), "A is live; got {found:?}");
-    assert!(!found.contains(&"only_a".to_string()), "reached via A; got {found:?}");
+    assert!(
+        found.contains(&"only_b".to_string()),
+        "downstream too; got {found:?}"
+    );
+    assert!(
+        !found.contains(&"A::process".to_string()),
+        "A is live; got {found:?}"
+    );
+    assert!(
+        !found.contains(&"only_a".to_string()),
+        "reached via A; got {found:?}"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 

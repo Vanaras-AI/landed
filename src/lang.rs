@@ -52,7 +52,12 @@ impl Language {
     }
 
     pub fn all() -> &'static [Language] {
-        &[Language::Rust, Language::Python, Language::TypeScript, Language::Go]
+        &[
+            Language::Rust,
+            Language::Python,
+            Language::TypeScript,
+            Language::Go,
+        ]
     }
 }
 
