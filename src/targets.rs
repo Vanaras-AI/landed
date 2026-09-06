@@ -70,6 +70,32 @@ impl Workspace {
     /// Directories to scan: the parent of every production target's entry
     /// file. Test, bench, example and build-script targets are excluded by
     /// cargo's own classification rather than by path matching.
+    /// Directories holding cargo's own test targets.
+    ///
+    /// An integration test is a separate crate, so it is not under any lib or
+    /// bin source dir and was never read. That left the analysis computing
+    /// "only tests reach this" while blind to most of the tests: 105 of 137
+    /// on this repository. It still reported the right functions, but with
+    /// the wrong evidence — "nothing reaches it at all" for code an
+    /// integration test exercises every run.
+    pub fn test_source_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = self
+            .targets
+            .iter()
+            // `NotProduction` collapses tests, benches and examples. Only
+            // tests are wanted: a benchmark reaching a function says nothing
+            // about which tests to run, and an example is documentation.
+            .filter(|t| {
+                matches!(t.kind, Kind::NotProduction)
+                    && t.src_path.to_string_lossy().contains("/tests/")
+            })
+            .filter_map(|t| t.src_path.parent().map(Path::to_path_buf))
+            .collect();
+        dirs.sort();
+        dirs.dedup();
+        dirs
+    }
+
     pub fn production_source_dirs(&self) -> Vec<PathBuf> {
         let mut dirs: Vec<PathBuf> = self
             .targets

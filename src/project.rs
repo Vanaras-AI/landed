@@ -131,7 +131,10 @@ impl Project for CargoProject {
         // Cargo knows exactly which files it compiles, including targets
         // declared in the manifest that live nowhere the convention predicts.
         let dirs = if self.workspace.from_cargo {
-            let d = self.workspace.production_source_dirs();
+            let mut d = self.workspace.production_source_dirs();
+            d.extend(self.workspace.test_source_dirs());
+            d.sort();
+            d.dedup();
             if d.is_empty() {
                 crate::frontend::syn_frontend::resolve_roots(&self.root)
             } else {

@@ -25,7 +25,19 @@ impl Frontend for SynFrontend {
     }
 
     fn extract(&self, root: &Path) -> anyhow::Result<Extract> {
-        let roots = resolve_roots(root);
+        // Production dirs, plus cargo's own test targets.
+        //
+        // An integration test is a separate crate living outside every lib
+        // and bin source dir, so it was never read at all. The analysis was
+        // deciding "only tests reach this" while blind to most of the tests —
+        // 105 of 137 on this repository. The verdicts held up, because a
+        // function an integration test exercises is usually production-
+        // reachable too, but the evidence shown for them was wrong: code
+        // covered every run was described as reached by nothing.
+        let mut roots = resolve_roots(root);
+        roots.extend(crate::targets::discover(root).test_source_dirs());
+        roots.sort();
+        roots.dedup();
         let mut out = Extract::default();
 
         for croot in &roots {
