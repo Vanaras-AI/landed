@@ -50,12 +50,12 @@ test, and each fails without it.
 **On large real crates it currently over-reports.** Measured findings, default
 versus precise:
 
-| Crate | default | precise |
-|---|---:|---:|
-| fd | 0 | 10 |
-| bat | 1 | 18 |
-| coda | 15 | 101 |
-| vibeEmu | 16 | 49 |
+| Crate | functions | default | precise |
+|---|---:|---:|---:|
+| A | 158 | 0 | 10 |
+| B | 445 | 1 | 18 |
+| C | 667 | 15 | 101 |
+| D | 1004 | 16 | 49 |
 
 The cause is edge coverage, not identity. This tier reads a dump the compiler
 prints for humans, and a call form the parser does not recognise is a call it
@@ -86,12 +86,15 @@ Every column from the current build, on real crates:
 
 | Crate | functions | ambiguous, default | ambiguous, precise | findings, default | findings, precise |
 |---|---:|---:|---:|---:|---:|
-| landed | 105 | 16 (15.2%) | 14 (13.3%) | 0 | 2 |
-| fd | 158 | 41 (25.9%) | 41 (25.9%) | 0 | 10 |
-| hyperfine | 155 | 54 (34.8%) | 54 (34.8%) | 1 | 6 |
-| bat | 445 | 127 (28.5%) | 127 (28.5%) | 1 | 18 |
-| coda | 667 | 78 (11.7%) | 76 (11.4%) | 15 | 101 |
-| vibeEmu | 1004 | 314 (31.3%) | 294 (29.3%) | 16 | 49 |
+| this one | 105 | 16 (15.2%) | 14 (13.3%) | 0 | 2 |
+| A | 158 | 41 (25.9%) | 41 (25.9%) | 0 | 10 |
+| E | 155 | 54 (34.8%) | 54 (34.8%) | 1 | 6 |
+| B | 445 | 127 (28.5%) | 127 (28.5%) | 1 | 18 |
+| C | 667 | 78 (11.7%) | 76 (11.4%) | 15 | 101 |
+| D | 1004 | 314 (31.3%) | 294 (29.3%) | 16 | 49 |
+
+Crates are lettered rather than named; the same letter means the same crate in
+both tables.
 
 **Ambiguity falls only slightly.** Identity promotion requires MIR's qualifier
 to match metadata `syn` independently recorded — a receiver type, or a module
