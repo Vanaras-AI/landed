@@ -41,6 +41,34 @@ enum Cmd {
         out: Option<PathBuf>,
     },
 
+    /// Which tests can reach a change, and which therefore need not run.
+    ///
+    /// Answered over the permissive graph: omitting a test that would have
+    /// caught the change is the expensive mistake, and running one extra is
+    /// not. Verify with `scripts/soundness.py` before trusting it to skip
+    /// anything.
+    Impact {
+        /// Path to the project (defaults to current directory).
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Changed functions, by name. Repeatable.
+        #[arg(long, value_name = "FN")]
+        symbol: Vec<String>,
+
+        /// Take the change from `git diff <REV>` instead.
+        #[arg(long, value_name = "REV")]
+        since: Option<String>,
+
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+
+        /// Analyse the tree as this language instead of the detected one.
+        #[arg(long, value_name = "LANG")]
+        lang: Option<landed::lang::Language>,
+    },
+
     /// Scan a crate for functions that only tests ever call.
     Check {
         /// Path to the crate root (defaults to current directory).
@@ -123,6 +151,78 @@ fn entries_now(scan: &scan::Scan, graph: bool, root: &std::path::Path) -> Vec<ba
     v
 }
 
+/// Changed line numbers per file, from `git diff`.
+///
+/// Returns the hunks it understood and a list of what it could not, because a
+/// change this cannot read must widen the answer rather than shrink it.
+#[allow(clippy::type_complexity)]
+fn changed_lines(
+    path: &std::path::Path,
+    rev: &str,
+) -> anyhow::Result<(Vec<(PathBuf, Vec<usize>)>, Vec<String>)> {
+    let out = std::process::Command::new("git")
+        .args(["diff", "--unified=0", "--no-color", rev, "--"])
+        .current_dir(path)
+        .output()
+        .map_err(|e| anyhow::anyhow!("could not run git: {e}"))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git diff {rev} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+                .lines()
+                .next()
+                .unwrap_or("")
+        );
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+
+    let mut files: Vec<(PathBuf, Vec<usize>)> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    let mut current: Option<PathBuf> = None;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("+++ b/") {
+            current = Some(PathBuf::from(rest.trim()));
+            continue;
+        }
+        if line.starts_with("+++ /dev/null") {
+            // A deleted file: nothing left to attribute a line to.
+            if let Some(f) = current.take() {
+                skipped.push(format!("{} (deleted)", f.display()));
+            }
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("@@ ") else {
+            continue;
+        };
+        let Some(plus) = rest.split('+').nth(1) else {
+            continue;
+        };
+        let spec = plus.split(' ').next().unwrap_or("");
+        let mut it = spec.split(',');
+        let start: usize = match it.next().and_then(|v| v.parse().ok()) {
+            Some(v) => v,
+            None => continue,
+        };
+        let count: usize = it.next().and_then(|v| v.parse().ok()).unwrap_or(1);
+        if let Some(f) = &current {
+            let entry = match files.iter_mut().find(|(p, _)| p == f) {
+                Some(e) => e,
+                None => {
+                    files.push((f.clone(), Vec::new()));
+                    files.last_mut().unwrap()
+                }
+            };
+            // A zero-length hunk is a pure deletion; the line that replaced it
+            // is the one before.
+            let n = count.max(1);
+            for i in 0..n {
+                entry.1.push(start + i);
+            }
+        }
+    }
+    Ok((files, skipped))
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
@@ -147,6 +247,125 @@ fn main() -> anyhow::Result<()> {
             println!("Commit this file. Later runs with --baseline report only what is");
             println!("new, so CI can gate on additions without demanding the backlog");
             println!("be cleared first.");
+        }
+
+        Cmd::Impact {
+            path,
+            symbol,
+            since,
+            json,
+            lang,
+        } => {
+            let scan = scan::scan_crate_as(&path, landed::frontend::Tier::Default, lang)?;
+            let tests = scan::test_functions(&scan);
+            let all_tests = tests.len();
+            let opaque = tests.iter().filter(|t| t.opaque).count();
+
+            let mut changed: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut unmapped: Vec<String> = Vec::new();
+
+            for name in &symbol {
+                let keys: Vec<String> = scan
+                    .defs
+                    .iter()
+                    .filter(|d| d.name() == name || d.key() == *name)
+                    .map(|d| d.key())
+                    .collect();
+                if keys.is_empty() {
+                    unmapped.push(name.clone());
+                }
+                changed.extend(keys);
+            }
+
+            if let Some(rev) = &since {
+                let (hunks, skipped) = changed_lines(&path, rev)?;
+                for (file, lines) in hunks {
+                    let keys = scan::defs_at(&scan, &file, &lines);
+                    if keys.is_empty() {
+                        unmapped.push(format!("{} (no function matched)", file.display()));
+                    }
+                    changed.extend(keys);
+                }
+                unmapped.extend(skipped);
+            }
+
+            let hits = scan::tests_reaching(&scan, &changed);
+
+            let mut changed_sorted: Vec<&String> = changed.iter().collect();
+            changed_sorted.sort();
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "schema": 1,
+                        "changed_symbols": changed_sorted,
+                        "tests_total": all_tests,
+                        "tests_always_run": opaque,
+                        "tests_affected": hits.len(),
+                        "tests": hits,
+                        "unmapped": unmapped,
+                        "sound": unmapped.is_empty(),
+                    })
+                );
+                return Ok(());
+            }
+
+            println!("landed v{}", env!("CARGO_PKG_VERSION"));
+            println!("  {all_tests} test(s) found in this project");
+            if opaque > 0 {
+                println!("  {opaque} of them cross a process boundary and always run");
+            }
+            println!();
+
+            if changed.is_empty() {
+                println!("  No changed function was identified.");
+            } else {
+                let c = &changed_sorted;
+                println!("changed");
+                for k in c.iter().take(12) {
+                    println!("  {k}");
+                }
+                if c.len() > 12 {
+                    println!("  … and {} more", c.len() - 12);
+                }
+                println!();
+                println!(
+                    "affected   {} of {} test(s)",
+                    hits.len(),
+                    all_tests.max(hits.len())
+                );
+                for t in hits.iter().take(20) {
+                    println!("  {t}");
+                }
+                if hits.len() > 20 {
+                    println!("  … and {} more", hits.len() - 20);
+                }
+                println!();
+                if all_tests > 0 {
+                    println!(
+                        "reduction  {:.1}%  ({} test(s) need not run)",
+                        100.0 * (all_tests.saturating_sub(hits.len())) as f64 / all_tests as f64,
+                        all_tests.saturating_sub(hits.len())
+                    );
+                }
+            }
+
+            if !unmapped.is_empty() {
+                println!();
+                println!(
+                    "NOT SOUND — {} part(s) of this change could not be",
+                    unmapped.len()
+                );
+                println!("attributed to a function, so the set below is incomplete:");
+                for u in unmapped.iter().take(10) {
+                    println!("  {u}");
+                }
+                println!();
+                println!("Run the whole suite. A test-selection answer is only worth");
+                println!("having when nothing about the change is unaccounted for.");
+                std::process::exit(2);
+            }
         }
 
         Cmd::Check {

@@ -174,7 +174,14 @@ impl<'a> FileVisitor<'a> {
         SymbolId::nominal(self.fn_stack.last().cloned().unwrap_or_default())
     }
 
-    fn record_def(&mut self, name: String, span: Span, attrs: &[syn::Attribute], is_pub: bool) {
+    fn record_def(
+        &mut self,
+        name: String,
+        span: Span,
+        attrs: &[syn::Attribute],
+        is_pub: bool,
+        opaque: bool,
+    ) {
         let is_ffi = attrs.iter().any(|a| {
             let t = a.to_token_stream().to_string();
             a.path().is_ident("no_mangle") || t.contains("export_name") || t.contains("used")
@@ -190,12 +197,63 @@ impl<'a> FileVisitor<'a> {
             crate_root: self.crate_root.clone(),
             is_pub,
             is_test_fn: attrs.iter().any(is_test_attr),
+            opaque,
             is_ffi,
             self_ty: self.impl_ty.clone(),
             module: (!self.mod_stack.is_empty()).then(|| self.mod_stack.join("::")),
         });
     }
+}
 
+/// Does this body reach code through something no call edge crosses?
+///
+/// A test that runs the binary as a subprocess, opens a socket, or shells out
+/// exercises the whole program, and the call graph shows it calling almost
+/// nothing. Reading that as "this test is affected by nothing" is how a
+/// selection tool skips exactly the tests that catch integration bugs — this
+/// crate's own CLI tests were predicted to be affected by no change at all.
+///
+/// Matching is on identifiers in the body, so it over-triggers rather than
+/// under-triggers: a test wrongly marked opaque is merely always run.
+fn crosses_a_process_boundary(ts: &proc_macro2::TokenStream) -> bool {
+    const MARKERS: &[&str] = &[
+        // Spawning this program or any other.
+        "CARGO_BIN_EXE",
+        "Command",
+        "cargo_bin",
+        "assert_cmd",
+        "duct",
+        // Talking to something over a socket.
+        "TcpStream",
+        "TcpListener",
+        "UnixStream",
+        "reqwest",
+        "hyper",
+    ];
+    fn walk(ts: &proc_macro2::TokenStream, hit: &mut bool) {
+        for tt in ts.clone() {
+            match tt {
+                proc_macro2::TokenTree::Ident(id) => {
+                    let s = id.to_string();
+                    if MARKERS.contains(&s.as_str()) {
+                        *hit = true;
+                        return;
+                    }
+                }
+                proc_macro2::TokenTree::Group(g) => walk(&g.stream(), hit),
+                _ => {}
+            }
+            if *hit {
+                return;
+            }
+        }
+    }
+    let mut hit = false;
+    walk(ts, &mut hit);
+    hit
+}
+
+impl<'a> FileVisitor<'a> {
     fn record_edge(&mut self, to: String, span: Span, kind: EdgeKind) {
         let from = self.caller();
         self.out.edges.push(Edge {
@@ -225,10 +283,15 @@ impl<'a> FileVisitor<'a> {
                 TokenTree::Group(g) => {
                     if g.delimiter() == proc_macro2::Delimiter::Parenthesis {
                         if let Some(id) = prev.take() {
-                            if !self.in_test() {
-                                let span = id.span();
-                                self.record_edge(id.to_string(), span, EdgeKind::MacroToken);
-                            }
+                            // Recorded in test code as well as production,
+                            // and tagged. The fold keeps it out of the graph
+                            // the audit accuses over — token matching cannot
+                            // tell a call from a tuple-struct literal, and a
+                            // spurious *test* call would invent a finding —
+                            // while test selection, which must never omit a
+                            // test, still gets to see it.
+                            let span = id.span();
+                            self.record_edge(id.to_string(), span, EdgeKind::MacroToken);
                         }
                     }
                     // Nested groups hold the macro's real body.
@@ -279,7 +342,14 @@ impl<'ast, 'a> Visit<'ast> for FileVisitor<'a> {
         let is_test_fn = node.attrs.iter().any(is_test_attr) || has_cfg_test(&node.attrs);
         let is_pub = matches!(node.vis, syn::Visibility::Public(_));
         let name = node.sig.ident.to_string();
-        self.record_def(name.clone(), node.sig.ident.span(), &node.attrs, is_pub);
+        let opaque = crosses_a_process_boundary(&node.block.to_token_stream());
+        self.record_def(
+            name.clone(),
+            node.sig.ident.span(),
+            &node.attrs,
+            is_pub,
+            opaque,
+        );
         self.fn_stack.push(name);
         if is_test_fn {
             self.test_depth += 1;
@@ -294,7 +364,14 @@ impl<'ast, 'a> Visit<'ast> for FileVisitor<'a> {
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
         let is_pub = matches!(node.vis, syn::Visibility::Public(_));
         let name = node.sig.ident.to_string();
-        self.record_def(name.clone(), node.sig.ident.span(), &node.attrs, is_pub);
+        let opaque = crosses_a_process_boundary(&node.block.to_token_stream());
+        self.record_def(
+            name.clone(),
+            node.sig.ident.span(),
+            &node.attrs,
+            is_pub,
+            opaque,
+        );
         self.fn_stack.push(name);
         syn::visit::visit_impl_item_fn(self, node);
         self.fn_stack.pop();

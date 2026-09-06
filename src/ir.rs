@@ -155,6 +155,17 @@ pub struct Definition {
     /// A `#[test]`-style harness function: a root of the test-reachable set,
     /// never of the production one.
     pub is_test_fn: bool,
+    /// This function's reach cannot be read from the call graph.
+    ///
+    /// A test that spawns the program as a subprocess, opens a socket, or
+    /// drives a database exercises code through a boundary no static edge
+    /// crosses. It reaches everything, and any question about what it
+    /// touches has to answer "all of it" rather than "nothing I can see".
+    ///
+    /// Marking these is what makes test selection safe. Left unmarked, the
+    /// integration tests that run a CLI end to end are predicted to be
+    /// affected by nothing at all, and would be skipped for every change.
+    pub opaque: bool,
     /// Method of a trait impl — reachable by dynamic dispatch, so the absence
     /// of a direct call site proves nothing.
     pub trait_impl: bool,

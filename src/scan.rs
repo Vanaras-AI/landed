@@ -27,7 +27,25 @@ pub struct Scan {
     /// Aggregate call counts per symbol, derived from the edges.
     pub calls: HashMap<String, CallSites>,
     /// Adjacency: caller name -> names it invokes.
+    ///
+    /// Edges that could only ever *create* a finding are excluded, so this is
+    /// the graph a report may accuse someone with.
     pub edges: HashMap<String, HashSet<String>>,
+    /// The same graph with nothing excluded.
+    ///
+    /// The two exist because the safe direction is not the same for every
+    /// question. Reporting dead code must never accuse live code, so an edge
+    /// the frontend is unsure of is dropped. Choosing which tests to run must
+    /// never omit a test that would have caught the bug, so the same unsure
+    /// edge must be kept — running one test too many costs seconds, and
+    /// skipping one costs a released regression.
+    ///
+    /// A token inside `assert!(...)` is exactly such an edge: it may be a
+    /// call or a tuple-struct literal. Dropping it in test code is why the
+    /// audit does not invent findings, and keeping it is why test selection
+    /// can be sound. Measured on this crate: without it, four of the five
+    /// tests that catch a deliberate bug were not selected.
+    pub all_edges: HashMap<String, HashSet<String>>,
     /// Every crate `src/` dir that was read.
     pub crate_roots: Vec<PathBuf>,
     /// Crate layout as cargo reports it. Empty for non-Rust projects.
@@ -62,6 +80,7 @@ impl Default for Scan {
             defs: Vec::new(),
             calls: HashMap::new(),
             edges: HashMap::new(),
+            all_edges: HashMap::new(),
             crate_roots: Vec::new(),
             workspace: Workspace::default(),
             config: crate::config::Config::default(),
@@ -85,6 +104,7 @@ impl Scan {
     pub fn from_extract(ex: Extract, precision: Precision) -> Self {
         let mut calls: HashMap<String, CallSites> = HashMap::new();
         let mut edges: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut all_edges: HashMap<String, HashSet<String>> = HashMap::new();
 
         // An edge whose target the frontend could not qualify says only "some
         // function of this name was called". If definitions are keyed more
@@ -119,10 +139,19 @@ impl Scan {
         for e in &ex.edges {
             let from = e.from.to_string();
             for target in targets_of(&e.to) {
-                edges
+                all_edges
                     .entry(from.clone())
                     .or_default()
                     .insert(target.clone());
+                // An edge that cannot be trusted to create a finding stays
+                // out of the graph the report accuses over, and stays in the
+                // one test selection reasons over.
+                if !e.in_test || e.kind.can_create_finding() {
+                    edges
+                        .entry(from.clone())
+                        .or_default()
+                        .insert(target.clone());
+                }
 
                 let entry = calls.entry(target).or_default();
                 if e.in_test {
@@ -147,6 +176,7 @@ impl Scan {
             defs: ex.definitions,
             calls,
             edges,
+            all_edges,
             crate_roots: ex.crate_roots,
             reexported: ex.reexported,
             precision,
@@ -390,15 +420,112 @@ pub fn test_roots(scan: &Scan) -> std::collections::HashSet<String> {
     roots
 }
 
+/// Every test entry point in the project.
+pub fn test_functions(scan: &Scan) -> Vec<&Definition> {
+    let mut v: Vec<&Definition> = scan
+        .defs
+        .iter()
+        .filter(|d| d.is_test_fn && !d.name().is_empty())
+        .collect();
+    v.sort_by_key(|d| d.key());
+    v.dedup_by_key(|d| d.key());
+    v
+}
+
+/// Which tests can reach any of `targets`.
+///
+/// Answered over the whole graph, deliberately. For an audit an uncertain
+/// edge is dropped, because the cost of being wrong is accusing working code.
+/// Here the cost of being wrong is a regression reaching production because
+/// the test that would have caught it was not run. Those costs point in
+/// opposite directions, so the two questions are answered over different
+/// graphs, and this is the permissive one.
+pub fn tests_reaching(scan: &Scan, targets: &std::collections::HashSet<String>) -> Vec<String> {
+    let opaque_keys: std::collections::HashSet<String> = scan
+        .defs
+        .iter()
+        .filter(|d| d.opaque)
+        .map(|d| d.key())
+        .collect();
+
+    let mut hit: Vec<String> = Vec::new();
+    for t in test_functions(scan) {
+        let root: std::collections::HashSet<String> = std::iter::once(t.key()).collect();
+        // A test is affected if it reaches a changed symbol, and also if it
+        // *is* one: editing a test changes that test.
+        let reach = reachable_over(scan, &root, Graph::Everything);
+        // Opacity propagates backwards. A test rarely spawns a process
+        // itself; it calls a helper that does, and the helper is the one
+        // holding the marker. If anything a test can reach crosses a
+        // boundary, the test's own reach is unknown and it must run.
+        let crosses = t.opaque || reach.iter().any(|r| opaque_keys.contains(r));
+        if crosses || targets.contains(&t.key()) || reach.iter().any(|r| targets.contains(r)) {
+            hit.push(t.name().to_string());
+        }
+    }
+    hit.sort();
+    hit.dedup();
+    hit
+}
+
+/// Definitions whose body covers a changed line.
+///
+/// A hunk that touches no function at all — an import, a constant, a comment
+/// — yields nothing here, and the caller must treat that as "cannot tell"
+/// rather than "nothing was affected".
+pub fn defs_at(scan: &Scan, file: &Path, lines: &[usize]) -> Vec<String> {
+    let mut in_file: Vec<&Definition> = scan
+        .defs
+        .iter()
+        .filter(|d| d.file.ends_with(file) || file.ends_with(&d.file))
+        .collect();
+    in_file.sort_by_key(|d| d.line);
+
+    let mut out = Vec::new();
+    for &l in lines {
+        // The definition a line belongs to is the last one starting at or
+        // before it. Without an end position this is an approximation, and it
+        // errs toward attributing a line to the function above it.
+        if let Some(d) = in_file.iter().rfind(|d| d.line <= l) {
+            out.push(d.key());
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Everything reachable from `roots` by following call edges transitively.
+/// Which graph a question should be answered over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Graph {
+    /// Only edges that may be used to accuse someone. The audit's graph.
+    Accusable,
+    /// Every edge the frontends saw. The graph for questions where missing an
+    /// edge is the expensive mistake.
+    Everything,
+}
+
 pub fn reachable(
     scan: &Scan,
     roots: &std::collections::HashSet<String>,
 ) -> std::collections::HashSet<String> {
+    reachable_over(scan, roots, Graph::Accusable)
+}
+
+pub fn reachable_over(
+    scan: &Scan,
+    roots: &std::collections::HashSet<String>,
+    graph: Graph,
+) -> std::collections::HashSet<String> {
+    let adj = match graph {
+        Graph::Accusable => &scan.edges,
+        Graph::Everything => &scan.all_edges,
+    };
     let mut seen: std::collections::HashSet<String> = roots.clone();
     let mut queue: Vec<String> = roots.iter().cloned().collect();
     while let Some(n) = queue.pop() {
-        if let Some(callees) = scan.edges.get(&n) {
+        if let Some(callees) = adj.get(&n) {
             for c in callees {
                 if seen.insert(c.clone()) {
                     queue.push(c.clone());

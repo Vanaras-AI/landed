@@ -456,6 +456,7 @@ impl<'a> Walker<'a> {
                     // A test *function* by convention, so a whole file need
                     // not be test code for its tests to count as tests.
                     is_test_fn: self.in_test || name.starts_with("test_") || name == "setUp",
+                    opaque: false,
                     // A Python dunder is called by the language, not by
                     // name: `__call__` runs when an instance is applied,
                     // `__iter__` when it is looped over, and neither ever

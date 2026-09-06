@@ -992,6 +992,7 @@ bb0: {
             line: 1,
             in_test,
             is_test_fn: in_test,
+            opaque: false,
             trait_impl: false,
             allowed_dead: false,
             is_pub: false,
