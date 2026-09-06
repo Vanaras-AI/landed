@@ -235,8 +235,35 @@ impl Project for ConventionProject {
                     || stem.ends_with(".spec")
                     || stem.ends_with("_test")
             }
-            // The go tool defines this one exactly.
-            Language::Go => stem.ends_with("_test"),
+            // The go tool defines this one exactly — and then projects put
+            // shared test scaffolding in ordinary `.go` files so that other
+            // packages' tests can import it, which the naming rule alone
+            // reads as production code.
+            //
+            // Importing the standard `testing` package settles it. That
+            // package only functions inside a test binary — it registers
+            // flags and expects the test harness — so a file importing it is
+            // test support whatever it is called. It is also a rare thing to
+            // do: 5 files out of 521 on the project this was found on, so it
+            // discriminates rather than sweeps.
+            //
+            // Matching the *import*, not the word, deliberately. An earlier
+            // version of this analysis matched "test" as a substring and read
+            // "fastest" and "is a test hook" as test markers.
+            Language::Go => {
+                stem.ends_with("_test")
+                    || std::fs::read_to_string(p)
+                        .map(|src| {
+                            src.lines().any(|l| {
+                                let l = l.trim();
+                                l == "\"testing\""
+                                    || l.starts_with("\"testing\" ")
+                                    || l == "import \"testing\""
+                                    || l.starts_with("_ \"testing\"")
+                            })
+                        })
+                        .unwrap_or(false)
+            }
             Language::Rust => {
                 in_test_dir || stem == "tests" || stem == "test" || stem.ends_with("_test")
             }
@@ -255,44 +282,88 @@ impl Project for ConventionProject {
                         .map(|s| s.contains("package main"))
                         .unwrap_or(false)
                 }),
-            // A module guarded by `if __name__ == "__main__"` is runnable; so
-            // is a declared console script, and so is a package holding a
-            // `__main__.py`, which `python -m` runs on the strength of its
-            // name alone — nothing need be written inside it.
+            // Is this something people run, or something people import?
+            //
+            // A `__main__.py` and a console script say only that it *can* be
+            // run, and almost every serious library on PyPI can be: a web
+            // framework ships a dev server, a formatter ships a command. What
+            // makes a project a library is being packaged for other people's
+            // code to import — which `[project]` in pyproject.toml, or a
+            // setup.py, is exactly the declaration of.
+            //
+            // Reading only the runnable signals classified the best-known
+            // Python web framework as an application. That stops its public
+            // API being a root, and it then reported that framework's
+            // most-used function, and 39 functions behind it, as confidently
+            // dead. A tool that does this twice is never run again.
+            //
+            // So packaging decides: a project that declares a distribution is
+            // a library even when it also has a command, and an application
+            // is a repository you run and nobody installs.
             Language::Python => {
-                let declares_script = std::fs::read_to_string(self.root.join("pyproject.toml"))
-                    .map(|s| s.contains("[project.scripts]") || s.contains("console_scripts"))
-                    .unwrap_or(false);
-                declares_script
-                    || self.source_files().iter().any(|p| {
+                let packaged = self.root.join("setup.py").is_file()
+                    || self.root.join("setup.cfg").is_file()
+                    || std::fs::read_to_string(self.root.join("pyproject.toml"))
+                        .map(|s| s.contains("[project]") || s.contains("[tool.poetry]"))
+                        .unwrap_or(false);
+                !packaged
+                    && self.source_files().iter().any(|p| {
                         p.file_name().map(|f| f == "__main__.py").unwrap_or(false)
                             || std::fs::read_to_string(p)
                                 .map(|s| s.contains("__main__"))
                                 .unwrap_or(false)
                     })
             }
-            // `"bin"` is the only signal npm defines, and it covers CLIs
-            // alone. The two commonest kinds of TypeScript application
-            // declare themselves otherwise: a bundled web app is marked
-            // `"private": true`, because npm refuses to publish it and it was
-            // never meant for anyone to import, and it has an `index.html`
-            // for the bundler to use as its entry; an editor or runtime
-            // extension names its host in `"engines"` and is loaded by it.
+            // Ordered, because the signals overlap and the wrong order
+            // gets the common cases backwards.
             //
-            // Getting this wrong is not a small error. A library's whole
-            // public surface is a root, so calling an application a library
-            // makes every exported function reachable and the analysis says
-            // nothing at all — which is what it said about every TypeScript
-            // project until this was fixed.
+            // Two earlier signals were simply wrong. `"engines"` was read as
+            // "a host loads this", but almost every published library states
+            // `{"node": ">=20"}` there — a compatibility range, not a host.
+            // And `"private": true` was read as "not published", when on a
+            // monorepo root it means only that the *root* is not published
+            // while every package under it is. Between them they classified a
+            // widely-used state library as an application and reported half
+            // its functions dead.
+            //
+            // What survives is the same rule Python needed: a package that
+            // declares an import surface is a library, even when it also
+            // ships a command.
             Language::TypeScript => {
                 let manifest =
                     std::fs::read_to_string(self.root.join("package.json")).unwrap_or_default();
-                let has = |k: &str| manifest.contains(k);
-                has("\"bin\"")
-                    || has("\"private\": true")
-                    || has("\"private\":true")
-                    || has("\"engines\"")
-                    || self.root.join("index.html").is_file()
+                let json: serde_json::Value =
+                    serde_json::from_str(&manifest).unwrap_or(serde_json::Value::Null);
+                let has = |k: &str| json.get(k).is_some();
+
+                // 1. A host other than the runtime itself loads this and calls
+                //    into it — an editor extension, say. `node` and the
+                //    package managers are version constraints, not hosts.
+                let host_loaded = json
+                    .get("engines")
+                    .and_then(|e| e.as_object())
+                    .map(|o| {
+                        o.keys()
+                            .any(|k| !matches!(k.as_str(), "node" | "npm" | "yarn" | "pnpm"))
+                    })
+                    .unwrap_or(false);
+                if host_loaded {
+                    return true;
+                }
+
+                // 2. A bundler entry point beside the manifest: a web app.
+                if self.root.join("index.html").is_file() {
+                    return true;
+                }
+
+                // 3. Anything importable is a library, CLI or not.
+                if has("main") || has("module") || has("exports") || has("types") {
+                    return false;
+                }
+
+                // 4. A command and nothing to import: an application.
+                //    And a package declaring neither is something you run.
+                true
             }
             Language::Rust => self.root.join("src/main.rs").is_file(),
         }

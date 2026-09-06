@@ -18,8 +18,17 @@ fn write(dir: &Path, rel: &str, body: &str) {
     std::fs::write(p, body).unwrap();
 }
 
+/// A directory no other test can be using.
+///
+/// Keying on the name and the pid alone was not enough: two tests both asked
+/// for "lib", ran in parallel, and each wiped the other's tree on the way in.
+/// It passed alone and failed in the suite, which is the worst way for a test
+/// to be wrong. The counter makes every call distinct.
 fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("landed-lang-{name}-{}", std::process::id()));
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("landed-lang-{name}-{}-{n}", std::process::id()));
     std::fs::remove_dir_all(&dir).ok();
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -615,4 +624,202 @@ fn a_typescript_application_is_told_from_a_library() {
         );
         std::fs::remove_dir_all(&dir).ok();
     }
+}
+
+// ─── what a 23-repository sweep of public code taught ─────────
+//
+// Every test below is a defect found by pointing the tool at real projects
+// rather than at fixtures written in the subset it already read.
+
+/// A library that also ships a command is still a library. Read the runnable
+/// signals alone and the best-known Python web framework is an application —
+/// which stops its public API being a root, and then reports its most-used
+/// function as confidently dead.
+#[test]
+fn a_python_package_that_ships_a_cli_is_still_a_library() {
+    let dir = scratch("pylib");
+    write(
+        &dir,
+        "pyproject.toml",
+        "[project]\nname = \"demo\"\nversion = \"1.0\"\n\n[project.scripts]\ndemo = \"pkg.cli:main\"\n",
+    );
+    write(&dir, "pkg/__init__.py", "from .core import render\n");
+    write(&dir, "pkg/__main__.py", "from .cli import main\n\nmain()\n");
+    write(&dir, "pkg/core.py", "def render():\n    return 1\n");
+    write(&dir, "pkg/cli.py", "def main():\n    return 0\n");
+
+    let p = project::detect(&dir);
+    assert!(!p.is_application(), "a packaged distribution is a library");
+    assert!(
+        !dead_names(&dir).contains(&"render".to_string()),
+        "an exported function must not be reported: {:?}",
+        dead_names(&dir)
+    );
+}
+
+/// `__all__` and a package's `__init__.py` name modules, classes and free
+/// functions. They never name a method, so judging methods by that list marks
+/// a whole decorator API private and reports it dead.
+#[test]
+fn a_method_of_an_exported_class_is_public() {
+    let dir = scratch("pymethod");
+    write(
+        &dir,
+        "pyproject.toml",
+        "[project]\nname = \"d\"\nversion = \"1\"\n",
+    );
+    write(&dir, "pkg/__init__.py", "from .app import App\n");
+    write(
+        &dir,
+        "pkg/app.py",
+        "class App:\n    def run(self):\n        return 1\n\n    def _hidden(self):\n        return 2\n",
+    );
+    let names = dead_names(&dir);
+    assert!(!names.contains(&"run".to_string()), "got {names:?}");
+}
+
+/// A dunder is called by the language, not by name: `__call__` runs when an
+/// instance is applied. Its absence from the call graph proves nothing.
+#[test]
+fn python_dunders_are_not_reported() {
+    let dir = scratch("pydunder");
+    write(
+        &dir,
+        "pyproject.toml",
+        "[project]\nname = \"d\"\nversion = \"1\"\n",
+    );
+    write(&dir, "pkg/__init__.py", "from .wsgi import App\n");
+    write(
+        &dir,
+        "pkg/wsgi.py",
+        "class App:\n    def __call__(self, environ, start_response):\n        return []\n",
+    );
+    let names = dead_names(&dir);
+    assert!(!names.contains(&"__call__".to_string()), "got {names:?}");
+}
+
+/// JavaScript is read by the TypeScript frontend. A tool that silently reads
+/// nothing from a JavaScript project is worse than one that refuses to try.
+#[test]
+fn javascript_is_read() {
+    let dir = scratch("js");
+    write(
+        &dir,
+        "package.json",
+        r#"{"name":"d","bin":{"d":"src/main.js"}}"#,
+    );
+    write(
+        &dir,
+        "src/core.js",
+        "export function liveHelper() { return 1; }\n\
+         export function deadHelper() { return deeper(); }\n\
+         function deeper() { return 2; }\n\
+         export function run() { return liveHelper(); }\n",
+    );
+    write(
+        &dir,
+        "src/main.js",
+        "import { run } from \"./core\";\nrun();\n",
+    );
+    write(
+        &dir,
+        "__tests__/core.test.js",
+        "import { deadHelper } from \"../src/core\";\ntest(\"d\", () => { deadHelper(); });\n",
+    );
+    assert_same_conclusion(&dir, "deadHelper", "deeper", &["liveHelper", "run"]);
+}
+
+/// `"engines": {"node": ">=20"}` is a compatibility range, and `"private"` on
+/// a monorepo root says only that the root is unpublished. Reading either as
+/// "this is an application" reported half a published library dead.
+#[test]
+fn a_node_engine_and_private_do_not_make_an_application() {
+    let dir = scratch("tslib");
+    write(
+        &dir,
+        "package.json",
+        r#"{"name":"d","private":true,"engines":{"node":">=20"},"main":"./src/index.ts"}"#,
+    );
+    write(
+        &dir,
+        "src/index.ts",
+        "export function api(): number { return 1; }\n",
+    );
+    assert!(!project::detect(&dir).is_application());
+
+    let ext = scratch("tsext");
+    write(
+        &ext,
+        "package.json",
+        r#"{"name":"e","engines":{"vscode":"^1.74.0"},"main":"./out/x.js"}"#,
+    );
+    write(&ext, "src/x.ts", "export function activate() {}\n");
+    assert!(
+        project::detect(&ext).is_application(),
+        "a named host loads this and calls into it"
+    );
+}
+
+/// A store library hands its API out as object properties. Neither form is a
+/// call site, and both are unmistakably uses.
+#[test]
+fn functions_handed_out_as_object_properties_are_not_dead() {
+    let dir = scratch("tsobj");
+    write(
+        &dir,
+        "package.json",
+        r#"{"name":"d","main":"./src/index.ts"}"#,
+    );
+    write(
+        &dir,
+        "src/index.ts",
+        "function setState() { return 1; }\n\
+         export function create() {\n\
+         \x20 return { setState, clearStorage: () => 2 };\n\
+         }\n",
+    );
+    let names = dead_names(&dir);
+    assert!(
+        !names.contains(&"setState".to_string()),
+        "shorthand: {names:?}"
+    );
+    assert!(
+        !names.contains(&"clearStorage".to_string()),
+        "property: {names:?}"
+    );
+}
+
+/// Go projects put shared test scaffolding in ordinary `.go` files so other
+/// packages' tests can import it. Importing the standard `testing` package
+/// settles what such a file is — it only works inside a test binary.
+#[test]
+fn a_go_file_importing_testing_is_test_code() {
+    let dir = scratch("gotesting");
+    go(&dir);
+    write(
+        &dir,
+        "helpers.go",
+        "package main\n\nimport \"testing\"\n\nfunc AssertThing(t *testing.T) { deadHelper() }\n",
+    );
+    let p = project::detect(&dir);
+    assert!(p.is_test_file(&dir.join("helpers.go")));
+    assert!(!p.is_test_file(&dir.join("main.go")));
+}
+
+/// Go interfaces are structural: a type satisfies one by having the methods,
+/// with nothing written down to say so. An exported method may therefore be
+/// reached through an interface no syntax reveals.
+#[test]
+fn an_exported_go_method_is_not_reported() {
+    let dir = scratch("gomethod");
+    go(&dir);
+    write(
+        &dir,
+        "render.go",
+        "package main\n\ntype R struct{}\n\n\
+         func (r R) Render() int { return 1 }\n\
+         func (r R) internal() int { return 2 }\n",
+    );
+    let names = dead_names(&dir);
+    assert!(!names.contains(&"Render".to_string()), "got {names:?}");
 }

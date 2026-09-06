@@ -18,7 +18,7 @@ impl Language {
         match self {
             Language::Rust => "rust",
             Language::Python => "python",
-            Language::TypeScript => "typescript",
+            Language::TypeScript => "typescript/javascript",
             Language::Go => "go",
         }
     }
@@ -28,7 +28,11 @@ impl Language {
         match self {
             Language::Rust => &["rs"],
             Language::Python => &["py"],
-            Language::TypeScript => &["ts", "tsx", "mts", "cts"],
+            // JavaScript is read by the same frontend. The grammars are
+            // sibling dialects, the analysis is identical, and a tool that
+            // silently read nothing from a 531-file JavaScript project would
+            // be worse than one that refused to try.
+            Language::TypeScript => &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"],
             Language::Go => &["go"],
         }
     }
@@ -67,7 +71,7 @@ impl std::str::FromStr for Language {
         match s.to_ascii_lowercase().as_str() {
             "rust" | "rs" => Ok(Language::Rust),
             "python" | "py" => Ok(Language::Python),
-            "typescript" | "ts" => Ok(Language::TypeScript),
+            "typescript" | "ts" | "javascript" | "js" => Ok(Language::TypeScript),
             "go" | "golang" => Ok(Language::Go),
             other => Err(format!(
                 "unknown language {other:?}; known: rust, python, typescript, go"
