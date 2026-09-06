@@ -97,10 +97,15 @@ landed check --graph --precise    # needs nightly and a crate that compiles
 
 resolves calls through the compiler instead. It distinguishes same-named
 symbols the default cannot — `A::process` from `B::process`, `alpha::helper`
-from `beta::helper` — but on real crates it settles only a few percent of the
-total ambiguity, because promoting an identity requires a correspondence
-between what MIR printed and what syn recorded, and where that cannot be
+from `beta::helper` — and on the crates measured it settles most of the
+ambiguity: 27.7% of names down to 6.1% on this repository, 23.1% to 13.9% on
+the largest tested. A definition is promoted only where MIR's qualifier
+corresponds to metadata syn independently recorded; where it cannot be
 established the symbol stays nominal rather than being promoted on a guess.
+
+It is still not a CI gate. See [docs/precise-mode.md](docs/precise-mode.md)
+for what was wrong with its edge coverage, what was fixed, and what remains
+unverified.
 
 It never falls back. Missing nightly, a crate that does not compile, or a path
 that is not a cargo project are each reported with what to do — a mode whose

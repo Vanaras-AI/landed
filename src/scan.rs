@@ -678,14 +678,36 @@ pub fn evidence(scan: &Scan, name: &str) -> Evidence {
     let prod = reachable(scan, &roots);
     let test = reachable(scan, &test_roots(scan));
 
-    let defs: Vec<&FnDef> = scan.defs.iter().filter(|d| d.name() == name).collect();
+    // A definition is keyed by its symbol id, and once a precise tier has
+    // promoted it that key is qualified — `uci::parse_uci_line`, not
+    // `parse_uci_line`. The graph, the root set and the call counts are all
+    // keyed that way, so looking any of them up by the bare name silently
+    // finds nothing and reports a live function as reachable by no one.
+    //
+    // This is the surface the documentation tells people to verify findings
+    // with, so being wrong here is worse than being wrong in the report: it
+    // makes the tool disagree with itself and gives no way to tell which half
+    // is lying.
+    //
+    // Accept either spelling from the user, and answer over every key the
+    // name resolves to.
+    let defs: Vec<&FnDef> = scan
+        .defs
+        .iter()
+        .filter(|d| d.name() == name || d.key() == name)
+        .collect();
     let d0 = defs.first();
 
-    // Every function whose edge list contains this name.
+    let mut keys: std::collections::HashSet<String> = defs.iter().map(|d| d.key()).collect();
+    // A name with no definition here is still worth asking about: it may be
+    // called from this crate and defined elsewhere.
+    keys.insert(name.to_string());
+
+    // Every function whose edge list reaches any of those keys.
     let mut callers: Vec<(String, bool)> = scan
         .edges
         .iter()
-        .filter(|(_, tos)| tos.contains(name))
+        .filter(|(_, tos)| tos.iter().any(|t| keys.contains(t)))
         .map(|(from, _)| {
             let label = if from.is_empty() {
                 "<module level>".to_string()
@@ -732,13 +754,21 @@ pub fn evidence(scan: &Scan, name: &str) -> Evidence {
             .iter()
             .map(|d| (d.file.display().to_string(), d.line))
             .collect(),
-        in_production_set: prod.contains(name),
-        in_test_set: test.contains(name),
-        is_root: roots.contains(name),
+        in_production_set: keys.iter().any(|k| prod.contains(k)),
+        in_test_set: keys.iter().any(|k| test.contains(k)),
+        is_root: keys.iter().any(|k| roots.contains(k)),
         root_reason,
         callers,
-        prod_call_sites: scan.calls.get(name).map(|c| c.prod).unwrap_or(0),
-        test_call_sites: scan.calls.get(name).map(|c| c.test).unwrap_or(0),
+        prod_call_sites: keys
+            .iter()
+            .filter_map(|k| scan.calls.get(k))
+            .map(|c| c.prod)
+            .sum(),
+        test_call_sites: keys
+            .iter()
+            .filter_map(|k| scan.calls.get(k))
+            .map(|c| c.test)
+            .sum(),
         suppressed,
     }
 }

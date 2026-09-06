@@ -40,76 +40,103 @@ default:  "run" is ambiguous — nothing reported          (false negative)
 precise:  B::run — 2 functions, confident                (found)
 ```
 
-## Known limitation: edge coverage on large crates
+## Edge coverage: what was wrong, and what still is
 
 The tier is validated on controlled cases — same-named methods, same-named
 free functions in different modules, a name shared between a test and
 production, production versus test-only reachability. Each is a regression
 test, and each fails without it.
 
-**On large real crates it currently over-reports.** Measured findings, default
-versus precise:
+It nonetheless over-reported badly on real crates, and this document
+previously said the cause was "a call form the parser does not recognise".
+That was the right kind of answer and the wrong one in fact. Measuring it —
+counting call terminators in a real dump against the ones the parser
+attributed — put edge loss at **47.8% on one crate and 25% on another**, and
+named three specific defects, none of them a call form:
 
-| Crate | functions | default | precise |
-|---|---:|---:|---:|
-| A | 158 | 0 | 10 |
-| B | 445 | 1 | 18 |
-| C | 667 | 15 | 101 |
-| D | 1004 | 16 | 49 |
+**The impl block is printed as a source span.** A method's header reads
+`config::<impl at src/config.rs:35:1: 35:12>::is_root`, and the parser
+recognised that form only as a *prefix*, never module-qualified. On one crate
+296 of 506 headers looked like this. Each was rejected, attribution stopped,
+and every call in the body was discarded. The receiver type MIR prints in the
+parameter list — `_1: &Config` — is the identity a call site would name, and
+is now used.
 
-The cause is edge coverage, not identity. This tier reads a dump the compiler
-prints for humans, and a call form the parser does not recognise is a call it
-does not see; everything that call reached then looks unreachable. Closure
-bodies were one such form and are now attributed to the function that wrote
-them; there are evidently others.
+**A closure is not reliably printed after its parent.** Resolving a parent
+against what had been seen so far therefore lost every closure printed first.
+Parsing is now two-pass: collect identities, then attribute.
 
-The mode says so rather than presenting the number as fact:
+**A call to a function returning `!` has no return successor.** MIR writes
+`_1 = run_stdio() -> unwind continue;` with no successor list, and the parser
+required one. A `main` whose body is one call to a never-returning run loop
+produces exactly that line and nothing else — so on one crate the entire
+binary was unreachable, and with it every function the program actually runs.
+
+Together these recovered **97% more edges on one crate and 25% on another**.
+
+## Partial MIR is refused
+
+`cargo rustc` passes trailing arguments to one target, so a workspace is
+dumped a target at a time. If a target failed to compile, its failure used to
+be discarded as long as some other target succeeded.
+
+That is the worst available outcome. Definitions come from source, so every
+function in the failed target keeps its definition and loses every call it
+makes; everything those calls reached is then reported unreachable, and
+nothing in the output says which half of the graph is missing. Precise mode
+now refuses, and names the targets that did not build.
+
+The same reasoning already governs the mode's refusal to fall back at all.
+
+## Where it stands now
+
+| Crate | functions | ambiguous, default | ambiguous, precise | findings, default | findings, precise |
+|---|---:|---:|---:|---:|---:|
+| this one | 148 | 41 (27.7%) | 9 (6.1%) | 0 | 0 |
+| F | 848 | 196 (23.1%) | 118 (13.9%) | 20 | 33 |
+| G | 27 | 4 | 4 | 14 | 21 |
+| H | 48 | 2 | 2 | 0 | 0 |
+
+**On this crate precise now reports nothing.** It previously reported two, and
+both were false: each was called only from inside a closure, and the closure's
+calls were being dropped.
+
+**On G every addition was checked against the source and every one was real.**
+Two are methods with no caller of any kind; the rest are one module reachable
+only from its own test functions and an integration test. The default tier
+missed them because their names were ambiguous.
+
+**On F the additions are not all verified.** Four that were checked — a `main`,
+the run loop it calls, and two parsers below that — were false and are now
+fixed. The remaining thirteen have not been read one by one, so the honest
+statement is that the tier is much better and not yet proven.
+
+Ambiguity is what the tier is for, and it now settles most of it: 27.7% to
+6.1% on this crate, 23.1% to 13.9% on the largest. An earlier version of this
+document claimed 52% and 62% from a matching rule that was unsound; those
+numbers were withdrawn, and these come from a rule that promotes a definition
+only when MIR's qualifier corresponds to metadata `syn` independently
+recorded.
+
+## Known limits
+
+- **`no_std` crates cannot be analysed.** The mode compiles with `--profile
+  test`, which links std's panic handler and collides with the crate's own:
+  `found duplicate lang item 'panic_impl'`. The test profile is not optional —
+  it is the only way MIR sees a `#[cfg(test)]` body — so this is a real
+  exclusion rather than a bug to fix. The mode reports it and refuses.
+- **A large increase over the default tier is still a warning sign**, and the
+  report says so. Gate CI on the default tier; use `--precise` to investigate
+  what the default declined to judge, and confirm each finding with
+  `--explain`.
 
 ```
-CAUTION — precise mode reports 101 findings; the default reports 15.
-  This tier resolves identity from the compiler's human-readable MIR
-  dump. A call form its parser does not recognise is a call it does not
-  see ... Treat the additions as leads, verify with --explain, and trust
+CAUTION — precise mode reports 33 findings; the default reports 20.
+  ... Treat the additions as leads, verify with --explain, and trust
   the default tier where the two disagree.
 ```
 
 `summary.nominal_findings` carries the same comparison in JSON.
-
-**Until edge coverage is closed, `--precise` is a lead-generator for
-ambiguous symbols, not a CI gate.** Gate on the default tier; use `--precise`
-to investigate what the default declined to judge, and confirm each with
-`--explain`.
-
-## What it measurably does, and does not
-
-Every column from the current build, on real crates:
-
-| Crate | functions | ambiguous, default | ambiguous, precise | findings, default | findings, precise |
-|---|---:|---:|---:|---:|---:|
-| this one | 105 | 16 (15.2%) | 14 (13.3%) | 0 | 2 |
-| A | 158 | 41 (25.9%) | 41 (25.9%) | 0 | 10 |
-| E | 155 | 54 (34.8%) | 54 (34.8%) | 1 | 6 |
-| B | 445 | 127 (28.5%) | 127 (28.5%) | 1 | 18 |
-| C | 667 | 78 (11.7%) | 76 (11.4%) | 15 | 101 |
-| D | 1004 | 314 (31.3%) | 294 (29.3%) | 16 | 49 |
-
-Crates are lettered rather than named; the same letter means the same crate in
-both tables.
-
-**Ambiguity falls only slightly.** Identity promotion requires MIR's qualifier
-to match metadata `syn` independently recorded — a receiver type, or a module
-path that MIR's qualifier is a suffix of. Where that correspondence cannot be
-established the definition is left nominal, because promoting on a guess would
-key a definition to something no call site reaches, and strand it.
-
-An earlier, looser rule reported far larger reductions (52%, 62%). It was
-matching on name and receiver alone, and the reductions were not sound; they
-are not reproduced here because the rule that produced them was replaced.
-
-The gap this tier was built to close is **not closed**. On these crates it
-settles a few percent of it. What it does reliably is distinguish specific
-same-named symbols once identity is established, which the regression cases
-demonstrate and which the nominal tier cannot do at all.
 
 ## How it works
 

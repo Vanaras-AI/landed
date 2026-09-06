@@ -288,6 +288,38 @@ fn dump_mir(dir: &Path) -> anyhow::Result<String> {
         );
     }
 
+    // A target that did not compile contributes no edges, but `syn` already
+    // contributed its definitions — every function in it keeps its identity
+    // and loses everything it calls. The result is not a smaller answer, it
+    // is a wrong one: whole modules are reported unreachable because the
+    // target holding their callers never produced MIR.
+    //
+    // This was silent until it was measured. On one 24-target crate it was
+    // the difference between 20 findings and 41, and the additions were live
+    // code whose callers lived in a target that failed to build.
+    //
+    // So partial MIR is refused outright, on the same reasoning the mode
+    // refuses to fall back at all: an answer built from half a call graph is
+    // worse than no answer, because nothing in it announces which half.
+    if !failures.is_empty() {
+        anyhow::bail!(
+            "--precise got MIR for only {} of {} target(s).\n\
+             \n\
+             {}\n\
+             \n\
+             Definitions are read from source, so functions in a target that \
+             did not compile keep their definitions and lose every call they \
+             make — and everything those calls reach is then reported \
+             unreachable. Rather than present that as a result, this refuses.\n\
+             \n\
+             Fix the build for those targets, or run without --precise: the \
+             syntactic analysis reads source directly and needs no build.",
+            selectors.len() - failures.len(),
+            selectors.len(),
+            failures.join("\n")
+        );
+    }
+
     if !text.contains("fn ") {
         anyhow::bail!(
             "cargo produced no MIR. The crate may have no compiled targets, or \
@@ -402,15 +434,31 @@ pub(crate) fn parse_definition(header: &str) -> Option<(SymbolId, Option<String>
     if head.contains('{') || head.contains('}') {
         return None;
     }
-    if let Some(rest) = head.strip_prefix("<impl at ") {
-        // `<impl at src/main.rs:4:1: 4:7>::process` — the impl span tells us
-        // nothing matchable, but the receiver type does.
-        let name = rest.rsplit("::").next()?.trim();
+    // `<impl at src/main.rs:4:1: 4:7>::process`, and the far commoner
+    // module-qualified `config::<impl at src/config.rs:35:1: 35:12>::is_root`.
+    //
+    // The span names a source location, not a type, so it matches nothing on
+    // the definition side. The receiver does: MIR prints a method's own
+    // parameter list, and `_1: &Config` is the type the call site would name.
+    //
+    // Reading this form only as a *prefix* was the single largest defect in
+    // this tier. On one crate 296 of 506 headers carried it — the majority of
+    // them module-qualified, so `parts.iter().all(valid_ident)` rejected the
+    // header, `current` fell to None, and every call in the body was
+    // discarded. That is 47.8% of the crate's call edges, and everything they
+    // reached was then reported unreachable.
+    if head.contains("<impl at ") {
+        let name = head.rsplit("::").next()?.trim();
         if !valid_ident(name) {
             return None;
         }
-        let ty = self_ty.clone()?;
-        return Some((SymbolId::typed(name, ty.clone()), Some(ty)));
+        return match self_ty.clone() {
+            Some(ty) => Some((SymbolId::typed(name, ty.clone()), Some(ty))),
+            // A synthesised header carries no parameters, so there is no
+            // receiver to read. The name alone still keys an edge, and a
+            // nominal id is what the syntactic tier would have produced.
+            None => Some((SymbolId::nominal(name), None)),
+        };
     }
     if head.starts_with('<') {
         // `<A as Trait>::method`
@@ -442,8 +490,24 @@ pub(crate) fn parse_call(line: &str) -> Option<SymbolId> {
     if t.starts_with("scope ") || t.starts_with("//") || t.starts_with('/') {
         return None;
     }
-    // A terminator assigns to a local and names its successor blocks.
-    if !t.starts_with('_') || !t.contains(") -> [") {
+    // A call terminator assigns to a local and names where control goes next.
+    //
+    // That successor list is written three ways, and reading only the first
+    // silently drops the other two:
+    //
+    //   _1 = f() -> [return: bb1, unwind continue];   the ordinary case
+    //   _1 = f() -> bb1;                              nothing to unwind
+    //   _1 = run_stdio() -> unwind continue;          f returns `!`
+    //
+    // The third is not an edge case. A `main` whose body is one call to a
+    // never-returning run loop produces exactly that line and nothing else,
+    // so missing it costs the entire binary: every function the program
+    // actually runs is then reachable from nothing.
+    //
+    // Widening to `) -> ` admits no new terminator kinds. `switchInt`,
+    // `assert`, `drop` and `goto` do not assign to a local, so the leading
+    // `_` and the ` = ` already exclude them.
+    if !t.starts_with('_') || !t.contains(") -> ") {
         return None;
     }
     let (_, rhs) = t.split_once(" = ")?;
@@ -468,31 +532,48 @@ fn closure_parent(head: &str) -> Option<&str> {
 }
 
 pub(crate) fn parse(mir: &str) -> Parsed {
+    // Two passes, because a closure is not reliably printed after the
+    // function that wrote it. Resolving a parent against what has been seen
+    // so far therefore loses the closures that come first, and a closure body
+    // holds real calls.
+    //
+    // Pass one collects every header's identity; pass two attributes calls.
     let mut out = Parsed::default();
-    let mut current: Option<SymbolId> = None;
+    let mut by_head: std::collections::HashMap<&str, SymbolId> = std::collections::HashMap::new();
 
+    for line in mir.lines() {
+        let Some(rest) = line.strip_prefix("fn ") else {
+            continue;
+        };
+        let head = rest.split('(').next().unwrap_or("").trim();
+        if closure_parent(head).is_some() {
+            // Nothing can call a closure by name, so it is not a definition.
+            continue;
+        }
+        if let Some((id, self_ty)) = parse_definition(rest) {
+            out.definitions.push(MirDef {
+                id: id.clone(),
+                self_ty,
+            });
+            by_head.insert(head, id);
+        }
+    }
+
+    let mut current: Option<SymbolId> = None;
     for line in mir.lines() {
         if let Some(rest) = line.strip_prefix("fn ") {
             let head = rest.split('(').next().unwrap_or("").trim();
-            if let Some(parent) = closure_parent(head) {
-                // Attribute the body to the enclosing function; record no
-                // definition, since nothing can call a closure by name.
-                current = parse_definition(&format!("{parent}()")).map(|(id, _)| id);
-                continue;
-            }
-            match parse_definition(rest) {
-                Some((id, self_ty)) => {
-                    out.definitions.push(MirDef {
-                        id: id.clone(),
-                        self_ty,
-                    });
-                    current = Some(id);
-                }
-                // Unrecognised header: emit nothing, and stop attributing
-                // calls until the next header we do understand. Attributing
-                // them to the previous function would invent edges.
-                None => current = None,
-            }
+            // A closure's calls belong to the function that wrote them, under
+            // exactly the id that function was recorded with. Re-deriving it
+            // from a synthesised `parent()` would lose the parameter list,
+            // and with it the receiver type that gives a method its identity.
+            //
+            // An unrecognised header stops attribution rather than letting it
+            // fall through to the previous function, which would invent edges.
+            current = match closure_parent(head) {
+                Some(parent) => by_head.get(parent).cloned(),
+                None => by_head.get(head).cloned(),
+            };
             continue;
         }
 
@@ -742,6 +823,114 @@ fn tests::t() -> () {
             .definitions
             .iter()
             .any(|d| d.id.to_string().contains("closure")));
+    }
+
+    /// The commonest header in any real dump, and the one that was silently
+    /// dropped: an inherent method, module-qualified, with the impl block
+    /// printed as a source span. On one crate 296 of 506 headers looked like
+    /// this and every call in their bodies was discarded — 48% of the graph.
+    #[test]
+    fn a_module_qualified_impl_span_header_keeps_its_calls() {
+        let mir = "\
+fn config::<impl at src/config.rs:35:1: 35:12>::is_root(_1: &Config, _2: &str) -> bool {
+    bb0: {
+        _3 = helper() -> [return: bb1, unwind continue];
+    }
+}
+";
+        let p = parse(mir);
+        assert!(
+            p.edges
+                .iter()
+                .any(|e| e.from.to_string() == "Config::is_root" && e.to.name == "helper"),
+            "{:?}",
+            dump(&p)
+        );
+    }
+
+    /// A closure is not reliably printed after the function that wrote it, so
+    /// resolving its parent against only what has been seen so far loses the
+    /// ones that come first. Here the closure is printed first.
+    #[test]
+    fn a_closure_printed_before_its_parent_is_still_attributed() {
+        let mir = "\
+fn outer::{closure#0}(_1: &{closure@src/x.rs:1:1: 1:2}) -> () {
+    bb0: {
+        _2 = inner() -> [return: bb1, unwind continue];
+    }
+}
+fn outer() -> () {
+    bb0: {
+        _1 = other() -> [return: bb1, unwind continue];
+    }
+}
+";
+        let p = parse(mir);
+        assert!(
+            p.edges
+                .iter()
+                .any(|e| e.from.to_string() == "outer" && e.to.name == "inner"),
+            "the closure's call belongs to outer: {:?}",
+            dump(&p)
+        );
+    }
+
+    /// A call to a function returning `!` has no return successor, so MIR
+    /// writes `-> unwind continue` rather than a successor list. A `main`
+    /// whose whole body is one such call produces exactly this and nothing
+    /// else; missing it costs every function the program actually runs.
+    #[test]
+    fn a_diverging_call_is_still_a_call() {
+        let mir = "\
+fn main() -> () {
+    bb0: {
+        _1 = run_stdio() -> unwind continue;
+    }
+}
+";
+        let p = parse(mir);
+        assert!(
+            p.edges
+                .iter()
+                .any(|e| e.from.to_string() == "main" && e.to.name == "run_stdio"),
+            "{:?}",
+            dump(&p)
+        );
+    }
+
+    /// A call that cannot unwind names a single successor block instead of a
+    /// list.
+    #[test]
+    fn a_single_successor_call_is_still_a_call() {
+        let mir = "\
+fn caller() -> () {
+    bb0: {
+        _1 = callee() -> bb1;
+    }
+}
+";
+        let p = parse(mir);
+        assert!(
+            p.edges
+                .iter()
+                .any(|e| e.from.to_string() == "caller" && e.to.name == "callee"),
+            "{:?}",
+            dump(&p)
+        );
+    }
+
+    /// Widening the terminator test must not admit terminators that are not
+    /// calls. None of these transfers control to a named function.
+    #[test]
+    fn non_call_terminators_are_still_not_calls() {
+        for line in [
+            "        switchInt(move _3) -> [0: bb2, otherwise: bb3];",
+            "        assert(!move (_4.1: bool), \"overflow\") -> [success: bb5, unwind continue];",
+            "        drop(_7) -> [return: bb8, unwind continue];",
+            "        goto -> bb1;",
+        ] {
+            assert!(parse_call(line).is_none(), "{line} is not a call");
+        }
     }
 
     #[test]
