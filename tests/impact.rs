@@ -160,3 +160,74 @@ fn the_audit_graph_stays_conservative() {
         "and must be present in the permissive one"
     );
 }
+
+/// The same rule has to hold in every language the tool reads. Detection
+/// lived only in the Rust frontend at first, so `impact` on a Python, Go or
+/// TypeScript project reported a confident, high skip rate and would have
+/// dropped every test that drives a subprocess.
+#[test]
+fn a_process_boundary_is_recognised_in_every_language() {
+    for (name, files, changed, test_name) in [
+        (
+            "py",
+            vec![
+                (
+                    "pyproject.toml",
+                    "[project]\nname = \"d\"\nversion = \"1\"\n",
+                ),
+                ("pkg/core.py", "def changed():\n    return 1\n"),
+                (
+                    "tests/test_e2e.py",
+                    "import subprocess\n\ndef test_end_to_end():\n    subprocess.run([\"demo\"])\n",
+                ),
+            ],
+            "changed",
+            "test_end_to_end",
+        ),
+        (
+            "go",
+            vec![
+                ("go.mod", "module demo\n\ngo 1.21\n"),
+                (
+                    "main.go",
+                    "package main\n\nfunc changed() int { return 1 }\nfunc main() { changed() }\n",
+                ),
+                (
+                    "e2e_test.go",
+                    "package main\n\nimport (\n\t\"os/exec\"\n\t\"testing\"\n)\n\n\
+                     func TestEndToEnd(t *testing.T) { _ = exec.Command(\"demo\").Run() }\n",
+                ),
+            ],
+            "changed",
+            "TestEndToEnd",
+        ),
+        (
+            "ts",
+            vec![
+                ("package.json", r#"{"name":"d","main":"./src/index.ts"}"#),
+                (
+                    "src/index.ts",
+                    "export function changed(): number { return 1; }\n",
+                ),
+                (
+                    "__tests__/e2e.test.ts",
+                    "import { execSync } from \"child_process\";\n\
+                     test(\"end to end\", () => { execSync(\"demo\"); });\n",
+                ),
+            ],
+            "changed",
+            "end to end",
+        ),
+    ] {
+        let dir = scratch(name);
+        for (rel, body) in files {
+            write(&dir, rel, body);
+        }
+        let hit = affected(&dir, changed);
+        assert!(
+            hit.iter()
+                .any(|t| t.contains(test_name) || test_name.contains(t.as_str())),
+            "{name}: a test that spawns a process must always run, got {hit:?}"
+        );
+    }
+}

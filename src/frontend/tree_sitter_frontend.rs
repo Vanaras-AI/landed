@@ -294,6 +294,67 @@ fn python_exports(files: &[std::path::PathBuf], parser: &mut Parser) -> HashSet<
     out
 }
 
+/// Does this body reach code through something no call edge crosses?
+///
+/// A test that runs a subprocess, opens a socket or drives a browser
+/// exercises the program from outside, and the call graph shows it calling
+/// almost nothing. Reading that as "affected by nothing" is how a selection
+/// tool skips exactly the tests that catch integration bugs.
+///
+/// Matched against the function's source text rather than its parse tree, so
+/// a mention in a comment or a string counts too. That over-triggers, and
+/// over-triggering is the safe direction: a test wrongly marked here is
+/// merely always run.
+fn crosses_a_boundary(text: &str, lang: Language) -> bool {
+    let markers: &[&str] = match lang {
+        Language::Python => &[
+            "subprocess",
+            "Popen",
+            "os.system",
+            "os.exec",
+            "pexpect",
+            "requests.",
+            "httpx.",
+            "aiohttp",
+            "urllib.request",
+            "socket.",
+            "selenium",
+            "webdriver",
+            "docker",
+            "psycopg",
+            "pymongo",
+        ],
+        Language::Go => &[
+            "exec.Command",
+            "os/exec",
+            "httptest.",
+            "http.Get",
+            "http.Post",
+            "net.Dial",
+            "net.Listen",
+            "sql.Open",
+            "testcontainers",
+        ],
+        Language::TypeScript => &[
+            "child_process",
+            "execSync",
+            "spawnSync",
+            "spawn(",
+            "execa",
+            "puppeteer",
+            "playwright",
+            "supertest",
+            "axios.",
+            "fetch(",
+            "request(",
+            "WebSocket",
+            "testcontainers",
+        ],
+        Language::Rust => &[],
+    };
+    markers.iter().any(|m| text.contains(m))
+}
+
 struct Walker<'a> {
     lang: Language,
     /// Names the project states are its public API. Empty means it stated
@@ -456,7 +517,10 @@ impl<'a> Walker<'a> {
                     // A test *function* by convention, so a whole file need
                     // not be test code for its tests to count as tests.
                     is_test_fn: self.in_test || name.starts_with("test_") || name == "setUp",
-                    opaque: false,
+                    opaque: self
+                        .text(node)
+                        .map(|t| crosses_a_boundary(&t, lang))
+                        .unwrap_or(false),
                     // A Python dunder is called by the language, not by
                     // name: `__call__` runs when an instance is applied,
                     // `__iter__` when it is looped over, and neither ever
@@ -524,6 +588,39 @@ impl<'a> Walker<'a> {
             }
         }
 
+        // `test("name", () => {...})` — a test in JavaScript and TypeScript is
+        // an anonymous callback passed to a runner, not a named function.
+        // Counting only named functions in test files counts the helpers and
+        // misses every actual test, which makes any answer about "which tests
+        // are affected" meaningless in the language's dominant idiom.
+        if self.lang == Language::TypeScript && kind == "call_expression" {
+            if let Some(name) = self.declared_test(node) {
+                self.out.definitions.push(Definition {
+                    id: SymbolId::nominal(name.clone()),
+                    precision: Precision::Nominal,
+                    file: self.file.to_path_buf(),
+                    line: node.start_position().row + 1,
+                    in_test: true,
+                    is_test_fn: true,
+                    trait_impl: false,
+                    allowed_dead: false,
+                    is_pub: false,
+                    is_ffi: false,
+                    opaque: self
+                        .text(node)
+                        .map(|t| crosses_a_boundary(&t, self.lang))
+                        .unwrap_or(false),
+                    crate_root: self.file.to_path_buf(),
+                    self_ty: None,
+                    module: self.module.clone(),
+                });
+                self.fn_stack.push(name);
+                self.walk_children(node);
+                self.fn_stack.pop();
+                return;
+            }
+        }
+
         if self.spec.calls.contains(&kind) {
             if let Some(to) = self.callee(node) {
                 self.record_edge(&to, node);
@@ -531,6 +628,39 @@ impl<'a> Walker<'a> {
         }
 
         self.walk_children(node);
+    }
+
+    /// A call that declares a test: `test("name", fn)`, `it("name", fn)`.
+    ///
+    /// Returns the name the runner will print, which is what a selection
+    /// answer has to name for anyone to act on it.
+    fn declared_test(&self, n: Node) -> Option<String> {
+        let callee = n.child_by_field_name("function")?;
+        let which = self.text(callee)?;
+        let base = which.rsplit('.').next().unwrap_or(&which);
+        if !matches!(base, "test" | "it") {
+            return None;
+        }
+        let args = n.child_by_field_name("arguments")?;
+        let mut cur = args.walk();
+        let mut children = args.named_children(&mut cur);
+        let first = children.next()?;
+        if first.kind() != "string" {
+            return None;
+        }
+        // A test declared with no body is a placeholder, not a test.
+        let has_body = children.any(|c| {
+            matches!(
+                c.kind(),
+                "arrow_function" | "function_expression" | "function"
+            )
+        });
+        if !has_body {
+            return None;
+        }
+        let raw = self.text(first)?;
+        let name = raw.trim_matches(['"', '\'', '`']).trim().to_string();
+        (!name.is_empty()).then_some(name)
     }
 
     fn record_edge(&mut self, to: &str, at: Node) {
