@@ -67,6 +67,15 @@ enum Cmd {
         /// Analyse the tree as this language instead of the detected one.
         #[arg(long, value_name = "LANG")]
         lang: Option<landed::lang::Language>,
+
+        /// Resolve calls with the compiler rather than by name.
+        ///
+        /// Selection is only as discriminating as the graph. A name-matched
+        /// graph fuses — every function reports the same affected set, which
+        /// is no answer at all — and this is the tier that exists to tell
+        /// same-named symbols apart.
+        #[arg(long)]
+        precise: bool,
     },
 
     /// Scan a crate for functions that only tests ever call.
@@ -255,8 +264,14 @@ fn main() -> anyhow::Result<()> {
             since,
             json,
             lang,
+            precise,
         } => {
-            let scan = scan::scan_crate_as(&path, landed::frontend::Tier::Default, lang)?;
+            let tier = if precise {
+                landed::frontend::Tier::Precise
+            } else {
+                landed::frontend::Tier::Default
+            };
+            let scan = scan::scan_crate_as(&path, tier, lang)?;
             let tests = scan::test_functions(&scan);
             let all_tests = tests.len();
             // Counted after propagation: a test that calls a helper that
