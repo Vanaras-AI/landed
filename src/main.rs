@@ -259,7 +259,12 @@ fn main() -> anyhow::Result<()> {
             let scan = scan::scan_crate_as(&path, landed::frontend::Tier::Default, lang)?;
             let tests = scan::test_functions(&scan);
             let all_tests = tests.len();
-            let opaque = tests.iter().filter(|t| t.opaque).count();
+            // Counted after propagation: a test that calls a helper that
+            // spawns a process is as unskippable as one that spawns it
+            // itself, and the second form is far commoner. Counting only the
+            // directly marked ones reported a 93% ceiling on a suite whose
+            // real ceiling was 14%.
+            let opaque = scan::always_run_tests(&scan).len();
 
             let mut changed: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut unmapped: Vec<String> = Vec::new();
@@ -317,6 +322,36 @@ fn main() -> anyhow::Result<()> {
                 println!("  {opaque} of them cross a process boundary and always run");
             }
             println!();
+
+            if changed.is_empty() && symbol.is_empty() && since.is_none() {
+                // Asked about the project rather than about a change. This is
+                // the number to read before trusting selection anywhere: the
+                // share of the suite that can never be skipped, because it
+                // reaches code through a boundary no call edge crosses.
+                //
+                // It is a property of the suite, not of this analyzer, and no
+                // amount of better resolution moves it. A suite that is mostly
+                // opaque cannot be selected from, however good the graph gets.
+                let pct = if all_tests == 0 {
+                    0.0
+                } else {
+                    100.0 * opaque as f64 / all_tests as f64
+                };
+                println!("suite profile");
+                println!("  {all_tests} test(s)");
+                println!("  {opaque} ({pct:.0}%) always run — they reach a process boundary");
+                println!();
+                println!(
+                    "  ceiling on any selection: {:.0}% of this suite could ever be skipped",
+                    100.0 - pct
+                );
+                println!();
+                println!("  A high figure here is not a defect in the analysis. It means");
+                println!("  the suite exercises the program from outside, and no static");
+                println!("  graph can prove such a test irrelevant. Measure this before");
+                println!("  measuring anything else.");
+                return Ok(());
+            }
 
             if changed.is_empty() {
                 println!("  No changed function was identified.");

@@ -432,6 +432,40 @@ pub fn test_functions(scan: &Scan) -> Vec<&Definition> {
     v
 }
 
+/// Tests that can never be skipped, whatever the change.
+///
+/// A test is here if it crosses a process boundary, or if anything it calls
+/// does. That second clause is most of them in practice: a suite rarely
+/// spawns a process from the test body, it calls a helper that does.
+///
+/// This is the ceiling on any selection, and it is a property of the suite
+/// rather than of this analyzer. No improvement in resolution moves it. A
+/// suite that is mostly opaque cannot be selected from at all, and that is
+/// worth knowing before anyone measures anything else.
+pub fn always_run_tests(scan: &Scan) -> Vec<String> {
+    let opaque_keys: std::collections::HashSet<String> = scan
+        .defs
+        .iter()
+        .filter(|d| d.opaque)
+        .map(|d| d.key())
+        .collect();
+
+    let mut v: Vec<String> = Vec::new();
+    for t in test_functions(scan) {
+        let root: std::collections::HashSet<String> = std::iter::once(t.key()).collect();
+        if t.opaque
+            || reachable_over(scan, &root, Graph::Everything)
+                .iter()
+                .any(|r| opaque_keys.contains(r))
+        {
+            v.push(t.name().to_string());
+        }
+    }
+    v.sort();
+    v.dedup();
+    v
+}
+
 /// Which tests can reach any of `targets`.
 ///
 /// Answered over the whole graph, deliberately. For an audit an uncertain

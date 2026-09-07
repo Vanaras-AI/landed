@@ -6,10 +6,14 @@
 landed check --graph .
 ```
 
-`landed` reads a project, builds its call graph, and reports functions the
+`landed` reads a project and builds its execution graph: what the running
+program can reach, what only the tests can reach, and what nothing reaches.
+
+From that one graph it answers two questions. **`check`** reports functions the
 tests can reach but the running program cannot. Not unused imports — whole
 features that were written, tested, reviewed, merged, and never connected to
-anything.
+anything. **`impact`** reports which tests a change can reach, and therefore
+which need not run — and says plainly when it cannot prove that.
 
 Reachability is a property of a call graph, not of a syntax, so the same
 analysis runs on **Rust, Python, TypeScript and Go**. The language is detected
@@ -118,6 +122,58 @@ when the two disagree. Gate on the default; use `--precise` to investigate what
 the default declined to judge.
 
 See [`docs/precise-mode.md`](docs/precise-mode.md).
+
+## Which tests a change can reach
+
+```bash
+landed impact                      # what this suite's ceiling is
+landed impact --since HEAD~1       # what this change can reach
+landed impact --symbol authorize   # or one function by name
+```
+
+**`landed` determines which tests can safely be skipped. When it cannot prove
+a test is irrelevant, it runs it.** That is the whole claim, and it is
+deliberately not "cut your suite by 80%" — the number belongs to your
+repository, not to this README.
+
+It is answered over a different graph from the audit, on purpose. Reporting
+dead code must never accuse working code, so an edge the frontend cannot
+vouch for is dropped. Choosing tests must never omit one that would have
+caught the bug, so the same edge is kept. Running a test that did not need to
+run costs seconds; skipping one ships a regression.
+
+### Two numbers decide whether this is worth anything to you
+
+```bash
+landed impact                 # the ceiling, before any change
+scripts/soundness.py .        # the miss rate
+```
+
+**The opaque fraction.** A test that spawns the program, opens a socket or
+drives a database reaches code through a boundary no call edge crosses. Such
+a test always runs, and so does anything that calls a helper which does one of
+those things. `landed impact` reports the share of your suite that is
+unskippable for that reason. On this repository it is 87%, so the ceiling on
+any selection here is 13% — and no improvement to the analysis moves it. It is
+a property of the suite.
+
+**The miss rate.** `scripts/soundness.py` breaks a function, runs the entire
+suite without stopping at the first failure, and checks that every test which
+failed was predicted. Anything but zero and selection must not ship. It works
+on Rust, Python, Go and TypeScript projects:
+
+```bash
+scripts/soundness.py ~/work/service --n 20
+```
+
+That script found this analysis unsound twice before it stopped finding it —
+first because tests that spawn a subprocess were predicted to be affected by
+nothing at all, then because opacity has to travel back up from the helper
+that spawns the process to the test that calls it.
+
+**Measure the ceiling first.** If most of a suite is opaque, selection cannot
+help there however good the graph gets, and the honest answer is to say so
+rather than to sell a percentage.
 
 ## Adopting it on a codebase that already has findings
 
@@ -296,6 +352,10 @@ it. [`docs/languages.md`](docs/languages.md) has the detail.
 
 ## Limits
 
+- **Test selection has a ceiling this cannot raise.** A suite that reaches the
+  program through subprocesses, sockets or a database is largely unskippable
+  by any static analysis, and `landed impact` says so rather than guessing.
+  Measure it before relying on selection.
 - **Four languages, one of them further along.** Rust, Python, TypeScript and
   Go are read; only Rust has a `--precise` tier, because it is the only one
   here whose compiler output this tool reads. All four have now been run
