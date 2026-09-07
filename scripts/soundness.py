@@ -118,9 +118,32 @@ def sources(repo, lang):
     return out
 
 
+def is_test_file(path, lang):
+    s = str(path)
+    stem = path.stem
+    if "/tests/" in s or "/test/" in s or "/__tests__/" in s or "/spec/" in s:
+        return True
+    if lang.name == "go":
+        return stem.endswith("_test")
+    if lang.name == "python":
+        return stem.startswith("test_") or stem.endswith("_test")
+    if lang.name == "typescript":
+        return stem.endswith(".test") or stem.endswith(".spec")
+    return stem in ("tests", "test") or stem.endswith("_test")
+
+
 def functions(repo, lang):
+    """Production functions only.
+
+    Mutating a *test* proves nothing about selection: a changed test is always
+    run, so it predicts itself and reports a reduction near 100%. Sampling
+    those alongside production functions inflated a real measurement from 40%
+    to 69% on the first codebase this was pointed at.
+    """
     found = []
     for p in sources(repo, lang):
+        if is_test_file(p, lang):
+            continue
         try:
             text = p.read_text(errors="ignore")
         except OSError:
@@ -196,6 +219,8 @@ def main():
     random.shuffle(pool)
 
     checked = unsound = 0
+    predicted_total = 0
+    suite_size = 0
     for path, fn in pool:
         if checked >= args.n:
             break
@@ -212,6 +237,8 @@ def main():
         if not failed:
             continue  # the fault changed nothing observable; proves nothing
         checked += 1
+        predicted_total += pred["tests_affected"]
+        suite_size = max(suite_size, pred["tests_total"])
         missed = sorted(failed - set(pred["tests"]))
         unsound += bool(missed)
         print(
@@ -221,8 +248,14 @@ def main():
         )
 
     print()
-    print(f"functions checked : {checked}")
+    print(f"functions checked : {checked}   (production only)")
     print(f"miss rate         : {unsound}/{checked}" if checked else "nothing was checked")
+    if checked and suite_size:
+        mean = predicted_total / checked
+        print(
+            f"mean selected     : {mean:.0f} of {suite_size} tests"
+            f"  -> {100 * (1 - mean / suite_size):.0f}% would not run"
+        )
     print()
     if checked and unsound == 0:
         print("SOUND — no test that failed went unpredicted.")

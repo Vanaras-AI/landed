@@ -144,6 +144,7 @@ impl Frontend for TreeSitterFrontend {
             HashSet::new()
         };
 
+        let mut strings: Vec<String> = Vec::new();
         let mut out = Extract {
             reexported: exports.clone(),
             ..Default::default()
@@ -169,6 +170,7 @@ impl Frontend for TreeSitterFrontend {
             };
             let mut w = Walker {
                 lang,
+                strings: &mut strings,
                 out: &mut out,
                 src: src.as_bytes(),
                 spec: &spec,
@@ -181,6 +183,33 @@ impl Frontend for TreeSitterFrontend {
             };
             w.walk(tree.root_node());
         }
+        // A name that only ever appears inside a template or a lookup key is
+        // called by reflection at run time, and nothing in the graph records
+        // who calls it. `{{if .HasHelpSubCommands}}` is a real example: the
+        // method is dispatched from a template string, so a change to it is
+        // reachable from tests that no edge connects to it.
+        //
+        // Marked rather than guessed at. The caller widens its answer instead
+        // of narrowing it, which is why only two shapes count: a string that
+        // is a template, and a string that is exactly the name — a lookup
+        // key. A name merely mentioned in a log line is not enough, or every
+        // function would be marked and the answer would always be "run
+        // everything".
+        let templates: Vec<&String> = strings.iter().filter(|s| s.contains("{{")).collect();
+        for d in &mut out.definitions {
+            if d.in_test {
+                continue;
+            }
+            let n = d.id.name.as_str();
+            let in_template = templates.iter().any(|t| t.contains(n));
+            let is_a_key = strings
+                .iter()
+                .any(|t| t.trim_matches(['"', '`', '\'']) == n);
+            if in_template || is_a_key {
+                d.opaque = true;
+            }
+        }
+
         out.crate_roots = vec![root.to_path_buf()];
         Ok(out)
     }
@@ -357,6 +386,9 @@ fn crosses_a_boundary(text: &str, lang: Language) -> bool {
 
 struct Walker<'a> {
     lang: Language,
+    /// Text of every string literal seen, for spotting names that are only
+    /// ever reached by reflection.
+    strings: &'a mut Vec<String>,
     /// Names the project states are its public API. Empty means it stated
     /// none, and the underscore convention stands in.
     exports: &'a HashSet<String>,
@@ -582,9 +614,34 @@ impl<'a> Walker<'a> {
         //
         // Without it, a store library's whole public surface, handed out as
         // object properties, reads as dead.
+        if matches!(
+            kind,
+            "string" | "raw_string_literal" | "interpreted_string_literal"
+        ) {
+            if let Some(t) = self.text(node) {
+                self.strings.push(t);
+            }
+        }
+
         if kind == "shorthand_property_identifier" {
             if let Some(name) = self.text(node) {
                 self.record_edge(&name, node);
+            }
+        }
+
+        // `ValidArgsFunction: NoFileCompletions` — a function handed over as a
+        // value, to be called by whoever received it. Not a call site, and
+        // unmistakably a use. Missing it made a completion helper look
+        // unaffected by any change, so the test that covers it was not
+        // selected.
+        //
+        // Restricted to positions where a value is genuinely being passed or
+        // stored. Matching every identifier anywhere would let a local
+        // variable that happens to share a function's name suppress a real
+        // finding.
+        if kind == "identifier" && self.names_a_value(node) {
+            if let Some(name) = self.text(node) {
+                self.record_reference(&name, node);
             }
         }
 
@@ -661,6 +718,72 @@ impl<'a> Walker<'a> {
         let raw = self.text(first)?;
         let name = raw.trim_matches(['"', '\'', '`']).trim().to_string();
         (!name.is_empty()).then_some(name)
+    }
+
+    /// Is this identifier being passed or stored, rather than called?
+    fn names_a_value(&self, n: Node) -> bool {
+        let Some(parent) = n.parent() else {
+            return false;
+        };
+        // The callee of a call is already an edge; recording it twice is
+        // harmless but pointless, and the field check keeps this honest.
+        if matches!(parent.kind(), "call_expression" | "call")
+            && parent.child_by_field_name("function").map(|f| f.id()) == Some(n.id())
+        {
+            return false;
+        }
+        // The name being *bound*, not a value being passed. `const unused =
+        // () => {}` has its own name in a declarator, and reading that as a
+        // use makes every definition reference itself — at module level that
+        // is a production root, so nothing is ever unreachable again.
+        for field in ["name", "left", "key"] {
+            if parent.child_by_field_name(field).map(|f| f.id()) == Some(n.id()) {
+                return false;
+            }
+        }
+        matches!(
+            parent.kind(),
+            // struct and object literals
+            "keyed_element"
+                | "literal_value"
+                | "pair"
+                // passed along
+                | "argument_list"
+                | "arguments"
+                // stored
+                | "assignment"
+                | "assignment_statement"
+                | "short_var_declaration"
+                | "var_spec"
+                | "const_spec"
+                | "variable_declarator"
+                // handed back
+                | "return_statement"
+                | "expression_list"
+                | "array"
+                | "list"
+        )
+    }
+
+    /// A use that is not a call.
+    ///
+    /// Tagged so it behaves like a macro token: it may suppress a finding,
+    /// never create one, and it is always visible to test selection.
+    fn record_reference(&mut self, to: &str, at: Node) {
+        let from = SymbolId::nominal(match self.fn_stack.last() {
+            Some(f) => f.clone(),
+            None if self.in_test => TEST_MODULE_ROOT.to_string(),
+            None => String::new(),
+        });
+        self.out.edges.push(Edge {
+            from,
+            to: SymbolId::nominal(to.to_string()),
+            kind: EdgeKind::MacroToken,
+            precision: Precision::Nominal,
+            in_test: self.in_test,
+            file: self.file.to_path_buf(),
+            line: at.start_position().row + 1,
+        });
     }
 
     fn record_edge(&mut self, to: &str, at: Node) {

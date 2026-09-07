@@ -482,6 +482,13 @@ pub fn tests_reaching(scan: &Scan, targets: &std::collections::HashSet<String>) 
         .map(|d| d.key())
         .collect();
 
+    let unknowable_callers: std::collections::HashSet<String> = scan
+        .defs
+        .iter()
+        .filter(|d| d.opaque && !d.in_test)
+        .map(|d| d.key())
+        .collect();
+
     let mut hit: Vec<String> = Vec::new();
     for t in test_functions(scan) {
         let root: std::collections::HashSet<String> = std::iter::once(t.key()).collect();
@@ -493,6 +500,13 @@ pub fn tests_reaching(scan: &Scan, targets: &std::collections::HashSet<String>) 
         // holding the marker. If anything a test can reach crosses a
         // boundary, the test's own reach is unknown and it must run.
         let crosses = t.opaque || reach.iter().any(|r| opaque_keys.contains(r));
+        // The dual case: a *changed* symbol whose callers cannot be
+        // enumerated — dispatched from a template, or looked up by name.
+        // Nothing shows which tests reach it, so every test might.
+        if targets.iter().any(|k| unknowable_callers.contains(k)) {
+            hit.push(t.name().to_string());
+            continue;
+        }
         if crosses || targets.contains(&t.key()) || reach.iter().any(|r| targets.contains(r)) {
             hit.push(t.name().to_string());
         }
