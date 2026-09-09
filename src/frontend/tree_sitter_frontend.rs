@@ -567,6 +567,18 @@ impl<'a> Walker<'a> {
                     trait_impl: (lang == Language::Python
                         && name.starts_with("__")
                         && name.ends_with("__"))
+                        // Registered with a framework by a decorator and
+                        // called by it, never by name:
+                        //
+                        //     @router.get("/check")
+                        //     async def auth_check() -> AuthCheckResponse:
+                        //
+                        // Nothing in the repository calls `auth_check`. The
+                        // web framework does, at request time, from a routing
+                        // table the decorator populated. On one service this
+                        // single missed class condemned 43 of 146 functions —
+                        // a third of the codebase — as one confident region.
+                        || self.is_registered_with_a_framework(node)
                         // A function written as an object-literal property —
                         // `{ clearStorage: () => {...} }` — is reached by
                         // property access on a value this tier cannot follow.
@@ -718,6 +730,88 @@ impl<'a> Walker<'a> {
         let raw = self.text(first)?;
         let name = raw.trim_matches(['"', '\'', '`']).trim().to_string();
         (!name.is_empty()).then_some(name)
+    }
+
+    /// Is this definition handed to something that will call it later?
+    ///
+    /// Matched on the decorator's *shape* rather than a list of frameworks:
+    /// `@thing.verb(...)` hands the function to `thing`, and `@verb(...)` with
+    /// a registering name does the same. That covers routes, tasks, commands,
+    /// fixtures, event handlers and middleware across libraries this has never
+    /// heard of, which a hard-coded list of decorator names would not.
+    ///
+    /// Deliberately does not match a bare `@staticmethod`, `@property` or
+    /// `@dataclass`: those change how a function is *called*, not who calls
+    /// it, and exempting them would silence real findings.
+    fn is_registered_with_a_framework(&self, node: Node) -> bool {
+        const REGISTERS: &[&str] = &[
+            "route",
+            "get",
+            "post",
+            "put",
+            "patch",
+            "delete",
+            "head",
+            "options",
+            "websocket",
+            "task",
+            "command",
+            "group",
+            "fixture",
+            "step",
+            "rule",
+            "on_event",
+            "middleware",
+            "listener",
+            "subscribe",
+            "handler",
+            "hook",
+            "callback",
+            "register",
+            "tool",
+            "agent",
+            "app",
+            "before_request",
+            "after_request",
+            "errorhandler",
+            "teardown",
+            "cli",
+            "action",
+            "event",
+        ];
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        if parent.kind() != "decorated_definition" {
+            return false;
+        }
+        let mut cur = parent.walk();
+        for child in parent.children(&mut cur) {
+            if child.kind() != "decorator" {
+                continue;
+            }
+            let Some(text) = self.text(child) else {
+                continue;
+            };
+            let head = text.trim_start_matches('@');
+            // `@router.get(...)` — handed to `router`.
+            let is_call = head.contains('(');
+            let last = head
+                .split('(')
+                .next()
+                .unwrap_or("")
+                .rsplit('.')
+                .next()
+                .unwrap_or("")
+                .trim();
+            if is_call && (head.contains('.') || REGISTERS.contains(&last)) {
+                return true;
+            }
+            if REGISTERS.contains(&last) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Is this identifier being passed or stored, rather than called?

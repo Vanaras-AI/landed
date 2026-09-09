@@ -823,3 +823,54 @@ fn an_exported_go_method_is_not_reported() {
     let names = dead_names(&dir);
     assert!(!names.contains(&"Render".to_string()), "got {names:?}");
 }
+
+/// A function registered with a framework by a decorator is called by that
+/// framework, never by name. Found by running the tool on a small multi-agent
+/// web service: one missed class of entry point reported 43 of its 146
+/// functions dead, as a single confident region.
+#[test]
+fn a_decorator_registered_handler_is_an_entry_point() {
+    // An application, deliberately. In a packaged library every public name
+    // is a root, so the last assertion below could not fail there.
+    let dir = scratch("decorated");
+    write(
+        &dir,
+        "app/__main__.py",
+        "from .api import serve\n\nserve()\n",
+    );
+    write(
+        &dir,
+        "app/api.py",
+        "from fastapi import APIRouter\n\nrouter = APIRouter()\n\n\
+         @router.get(\"/check\")\n\
+         async def auth_check():\n    return helper()\n\n\
+         def helper():\n    return 1\n\n\
+         def serve():\n    return router\n\n\
+         def genuinely_unused():\n    return 2\n",
+    );
+    // The finding this tool makes is "tests reach it, production cannot", so
+    // the orphan needs a test caller to be one at all.
+    write(
+        &dir,
+        "tests/test_api.py",
+        "from app.api import genuinely_unused, auth_check\n\n\
+         def test_orphan():\n    assert genuinely_unused() == 2\n\n\
+         def test_handler():\n    assert auth_check() is not None\n",
+    );
+
+    let names = dead_names(&dir);
+    assert!(
+        !names.contains(&"auth_check".to_string()),
+        "a route handler is entered by the framework: {names:?}"
+    );
+    assert!(
+        !names.contains(&"helper".to_string()),
+        "and so is everything behind it: {names:?}"
+    );
+    // The exemption must not swallow everything: an undecorated function that
+    // nothing calls is still a finding.
+    assert!(
+        names.contains(&"genuinely_unused".to_string()),
+        "an undecorated orphan must still be reported: {names:?}"
+    );
+}
